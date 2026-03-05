@@ -87,6 +87,76 @@ template <LWE::uint128_t q_int>
 LWERandomness::PseudoRandomGenerator *Ring2_common_pp<q_int>::prg;
 template <LWE::uint128_t q_int>
 LWERandomness::DiscreteGaussian *Ring2_common_pp<q_int>::dg;
+// Compile-time modular exponentiation
+constexpr uint64_t ct_modpow(uint64_t base, uint64_t exp, uint64_t mod) {
+    uint64_t res = 1;
+    base %= mod;
+    while (exp > 0) {
+        if (exp & 1) res = (static_cast<unsigned __int128>(res) * base) % mod;
+        base = (static_cast<unsigned __int128>(base) * base) % mod;
+        exp >>= 1;
+    }
+    return res;
+}
+
+// Compile-time primitive generator finder
+constexpr uint64_t get_generator(uint64_t p, uint64_t f1, uint64_t f2, uint64_t f3) {
+    for (uint64_t g = 2; g < p; g++) {
+        bool is_gen = true;
+        if (f1 != 0 && ct_modpow(g, (p - 1) / f1, p) == 1) is_gen = false;
+        if (f2 != 0 && ct_modpow(g, (p - 1) / f2, p) == 1) is_gen = false;
+        if (f3 != 0 && ct_modpow(g, (p - 1) / f3, p) == 1) is_gen = false;
+        if (is_gen) return g;
+    }
+    return 0;
+}
+
+template <typename ParamsBase>
+class Fp_b28_template_pp {
+public:
+    using Fp_type = libsnark::Field<uint64_t, ParamsBase::p_int>;
+
+    static LWERandomness::PseudoRandomGenerator *prg;
+    static LWERandomness::DiscreteGaussian *dg;
+
+    static void init_public_params() {
+        Fp_type::prg = Fp_b28_template_pp<ParamsBase>::prg;
+        Fp_type::dg = Fp_b28_template_pp<ParamsBase>::dg;
+        Fp_type::s = 25; 
+        
+        if constexpr (ParamsBase::p_int == 167772161) { 
+            constexpr uint64_t gen = get_generator(167772161, 2, 5, 0);
+            Fp_type::multiplicative_generator = Fp_type(gen);
+            Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 5, 167772161));
+        } 
+        else if constexpr (ParamsBase::p_int == 469762049) { 
+            constexpr uint64_t gen = get_generator(469762049, 2, 7, 0);
+            Fp_type::multiplicative_generator = Fp_type(gen);
+            Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 14, 469762049));
+        }
+        else if constexpr (ParamsBase::p_int == 1107296257) { 
+            constexpr uint64_t gen = get_generator(1107296257, 2, 3, 11);
+            Fp_type::multiplicative_generator = Fp_type(gen);
+            Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 33, 1107296257));
+        }
+        else if constexpr (ParamsBase::p_int == 1711276033) { 
+            constexpr uint64_t gen = get_generator(1711276033, 2, 3, 17);
+            Fp_type::multiplicative_generator = Fp_type(gen);
+            Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 51, 1711276033));
+        }
+        else if constexpr (ParamsBase::p_int == 1811939329) { 
+            constexpr uint64_t gen = get_generator(1811939329, 2, 3, 0);
+            Fp_type::multiplicative_generator = Fp_type(gen);
+            Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 54, 1811939329));
+        }
+    }
+};
+
+template <typename ParamsBase>
+LWERandomness::PseudoRandomGenerator* Fp_b28_template_pp<ParamsBase>::prg = nullptr;
+
+template <typename ParamsBase>
+LWERandomness::DiscreteGaussian* Fp_b28_template_pp<ParamsBase>::dg = nullptr;
 
 class Fp_b28_pp {
 public:
@@ -104,8 +174,6 @@ public:
     }
 };
 
-LWERandomness::PseudoRandomGenerator *Fp_b28_pp::prg;
-LWERandomness::DiscreteGaussian *Fp_b28_pp::dg;
 
 class Fp_b23_pp {
 public:

@@ -43,6 +43,28 @@ namespace LWE {
         static constexpr const uint32_t tau = 5;
         static constexpr const uint64_t p_int = 5 * (1 << 25) + 1;
     };
+    //DUPLICATE ABOVE STRUCT FOR FHE LIMBS
+    class B28FpParamsBase2 {
+    public:
+        static constexpr const uint32_t tau = 5;
+        static constexpr const uint64_t p_int = 14 * (1 << 25) + 1;
+    };
+    class B28FpParamsBase3 {
+    public:
+        static constexpr const uint32_t tau = 5;
+        static constexpr const uint64_t p_int = 33 * (1 << 25) + 1;
+    };
+    class B28FpParamsBase4 {
+    public:
+        static constexpr const uint32_t tau = 5;
+        static constexpr const uint64_t p_int = 51 * (1 << 25) + 1;
+    };
+    class B28FpParamsBase5 {
+    public:
+        static constexpr const uint32_t tau = 5;
+        static constexpr const uint64_t p_int = 54 * (1 << 25) + 1;
+    };
+
 
     class B13C10 : public B13Fp2ParamsBase {
     public:
@@ -769,13 +791,58 @@ namespace LWE {
         static constexpr const uint32_t n = 4580;
         static constexpr const uint64_t q_log = 118;
         static constexpr const uint128_t q_int = (uint128_t) 1 << q_log;
-        static constexpr const uint128_t rescale_q = 205634377241378;
+        static constexpr const uint128_t rescale_q = q_int;
         static constexpr const uint32_t query_num = 12;
         static constexpr const uint128_t b_int = 590679829335140766631067648_U128T;
         static constexpr const uint32_t pt_dim = query_num * query_size;
         static constexpr const double width = 18.0;
     };
-
+    //we will use C15 (hardness), make 4 more child classes for limbs
+    class B28C15_2 : public B28FpParamsBase2 {
+    public:
+        static constexpr const uint32_t n = 4580;
+        static constexpr const uint64_t q_log = 122;
+        static constexpr const uint128_t q_int = (uint128_t) 1 << q_log;
+        static constexpr const uint128_t rescale_q = q_int;
+        static constexpr const uint32_t query_num = 12;
+        static constexpr const uint128_t b_int = 590679829335140766631067648_U128T;
+        static constexpr const uint32_t pt_dim = query_num * query_size;
+        static constexpr const double width = 18.0;
+    };
+    class B28C15_3 : public B28FpParamsBase3 {
+    public:
+        static constexpr const uint32_t n = 4580;
+        static constexpr const uint64_t q_log = 122;
+        static constexpr const uint128_t q_int = (uint128_t) 1 << q_log;
+        static constexpr const uint128_t rescale_q = q_int;
+        static constexpr const uint32_t query_num = 12;
+        static constexpr const uint128_t b_int = 590679829335140766631067648_U128T;
+        static constexpr const uint32_t pt_dim = query_num * query_size;
+        static constexpr const double width = 18.0;
+    };
+    class B28C15_4 : public B28FpParamsBase4 {
+    public:
+        static constexpr const uint32_t n = 4580;
+        static constexpr const uint64_t q_log = 122;
+        static constexpr const uint128_t q_int = (uint128_t) 1 << q_log;
+        static constexpr const uint128_t rescale_q = q_int;
+        static constexpr const uint32_t query_num = 12;
+        static constexpr const uint128_t b_int = 590679829335140766631067648_U128T;
+        static constexpr const uint32_t pt_dim = query_num * query_size;
+        static constexpr const double width = 18.0;
+    };
+    class B28C15_5 : public B28FpParamsBase5 {
+    public:
+        static constexpr const uint32_t n = 4580;
+        static constexpr const uint64_t q_log = 122;
+        static constexpr const uint128_t q_int = (uint128_t) 1 << q_log;
+        static constexpr const uint128_t rescale_q = q_int;
+        static constexpr const uint32_t query_num = 12;
+        static constexpr const uint128_t b_int = 590679829335140766631067648_U128T;
+        static constexpr const uint32_t pt_dim = query_num * query_size;
+        static constexpr const double width = 18.0;
+    };
+    //END
     class B28C16 : public B28FpParamsBase {
     public:
         static constexpr const uint32_t n = 4600;

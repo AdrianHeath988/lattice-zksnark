@@ -19,7 +19,7 @@ int main(int argc, char *argv[]) {
     auto dg =
         new LWERandomness::DiscreteGaussian(Param::width, LWE::expand, *prg);
 
-    public_params_init<Fp_b28_pp, ring_pp>(prg, dg);
+    public_params_init<Fp_b23_pp, ring_pp>(prg, dg);
 
     int num_constraints = std::stoi(std::string(argv[1])),
         input_size = std::stoi(std::string(argv[2]));
@@ -32,7 +32,7 @@ int main(int argc, char *argv[]) {
               << "s = " << Param::width << std::endl;
 
     libff::start_profiling();
-    test_r1cs_lattice_snark<Fp_b28_pp, ring_pp, Param>(num_constraints,
+    test_r1cs_lattice_snark<Fp_b23_pp, ring_pp, Param>(num_constraints,
                                                        input_size);
 
     delete prg;
