@@ -2,6 +2,58 @@
 #define __R1CS_LATTICE_SNARK__
 
 #include "r1cs_lattice_snark_common.hpp"
+#include <cuda_runtime.h>
+// --- ADD THIS AT THE TOP OF r1cs_lattice_snark.hpp ---
+// Standard C++ declarations that hide the CUDA launch syntax
+void launch_accumulate_c_vec_kernel(
+    const void* d_enc_qs, 
+    const uint64_t* d_pi, 
+    void* d_out_c_vec, 
+    int index, 
+    int total_coeffs, 
+    int blocks_c, 
+    int threads_per_block);
+
+// void copy_aes_keys_to_constant(const uint32_t* host_keys);
+
+void launch_generate_a_vec_kernel(
+    const uint64_t* d_pi, 
+    void* d_out_a_vec, 
+    int index, 
+    int total_coeffs_a, 
+    int blocks_a, 
+    int threads_per_block,
+    uint64_t mod_mask_lo, 
+    uint64_t mod_mask_hi,
+    const uint32_t* d_aes_round_keys);
+
+// Forward declarations for your CUDA kernels
+template <typename DataType>
+extern __global__ void generate_and_accumulate_a_vec(
+    const uint32_t* aes_round_keys, 
+    const DataType* pi, 
+    DataType* out_a_vec, 
+    int index, 
+    int elements_per_poly, 
+    DataType modulus);
+
+template <typename DataType>
+extern __global__ void accumulate_c_vec(
+    const DataType* enc_qs, 
+    const DataType* pi, 
+    DataType* out_c_vec, 
+    int index, 
+    int total_coeffs, 
+    DataType modulus);
+
+// GPU Error checking macro
+#define cudaCheckError() { \
+    cudaError_t e=cudaGetLastError(); \
+    if(e!=cudaSuccess) { \
+        printf("CUDA Error %s:%d: %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); \
+        exit(EXIT_FAILURE); \
+    } \
+}
 
 namespace libsnark {
 
@@ -193,6 +245,7 @@ namespace libsnark {
         const r1cs_lattice_snark_crs<ppT, cpT, Params> &crs,
         const r1cs_primary_input<libff::Fr<ppT>> &primary_input,
         const r1cs_auxiliary_input<libff::Fr<ppT>> &auxiliary_input) {
+        
         libff::enter_block("Call to r1cs lattice snark prover");
 
         libff::enter_block("Compute H polynomial");
@@ -208,8 +261,8 @@ namespace libsnark {
         public_params_init<ppT, cpT>(temp_prg, temp_dg);
 
         const libff::Fr<ppT> d1 = libff::Fr<ppT>::random_element(),
-                             d2 = libff::Fr<ppT>::random_element(),
-                             d3 = libff::Fr<ppT>::random_element();
+                            d2 = libff::Fr<ppT>::random_element(),
+                            d3 = libff::Fr<ppT>::random_element();
         public_params_init<ppT, cpT>(original_prg, original_dg);
         delete temp_dg;
         delete temp_prg;
@@ -222,63 +275,202 @@ namespace libsnark {
         prepare_pi_proof<ppT>(qap_wit, pi);
         assert(pi.size() == crs.enc_qs->size());
 
-        temp_prg = new LWERandomness::PseudoRandomGenerator(crs.crs_aes_key);
-        temp_dg = new LWERandomness::DiscreteGaussian(Params::width,
-                                                      LWE::expand, *temp_prg);
-        original_prg = ppT::prg;
-        original_dg = ppT::dg;
-        public_params_init<ppT, cpT>(temp_prg, temp_dg);
-
-        libff::enter_block("Generating response");
+        libff::enter_block("Generating response (GPU Accelerated)");
 
         LWE::ciphertext<Rq_T<cpT>, libff::Fr<ppT>, Params> added;
-
         int index = crs.enc_qs.size();
 
-        libff::enter_block("Generating ct linear combination");
-        for (int i = 0; i < index; i++)
-            added.c_vec += crs.enc_qs[i] * pi[i];
-        libff::leave_block("Generating ct linear combination");
+        // Fix 1: The true underlying types revealed by the compiler
+        using ScalarType128 = unsigned __int128; 
+        
+        int total_coeffs_a = Params::n; 
+        // Fix 2: Extracted directly from the LWE::Vector<..., 53> error
+        int total_coeffs_c = 53; 
 
-        LWE::Vector<Rq_T<cpT>, Params::n> a_vec;
-
-        std::chrono::duration<double, std::micro> dur_rand{};
-        std::chrono::duration<double, std::milli> dur_lin{};
-        libff::enter_block("Generating a_vec linear combination");
-
+        // Flatten enc_qs for the GPU
+        // 1. Parallelize the heavy extraction loops
+        std::vector<uint64_t> flat_enc_qs(index * total_coeffs_c * 2);
+        uint64_t* flat_qs_ptr = flat_enc_qs.data(); // Raw pointer for speed
+        
+        #pragma omp parallel for collapse(2)
         for (int i = 0; i < index; i++) {
-            auto rnd_srt = std::chrono::high_resolution_clock::now();
-            a_vec.random_element();
-            auto rnd_end = std::chrono::high_resolution_clock::now();
-            auto linear_srt = std::chrono::high_resolution_clock::now();
-            added.a_vec += (a_vec *= pi[i]);
-            auto linear_end = std::chrono::high_resolution_clock::now();
-            dur_rand += (rnd_end - rnd_srt);
-            dur_lin += (linear_end - linear_srt);
+            for (int j = 0; j < total_coeffs_c; j++) {
+                unsigned __int128 val = crs.enc_qs[i][j].value;
+                uint64_t base_idx = ((uint64_t)i * total_coeffs_c + j) * 2;
+                flat_qs_ptr[base_idx] = (uint64_t)val;
+                flat_qs_ptr[base_idx + 1] = (uint64_t)(val >> 64);
+            }
         }
 
+        std::vector<uint64_t> flat_pi(index);
+        uint64_t* pi_ptr = flat_pi.data();
+        
+        #pragma omp parallel for
+        for(int i = 0; i < index; i++) {
+            pi_ptr[i] = pi[i].value; 
+        }
+
+        // Extract Mask
+        unsigned __int128 mask = crs.enc_qs[0][0].mod - 1;
+        uint64_t mod_mask_lo = (uint64_t)mask;
+        uint64_t mod_mask_hi = (uint64_t)(mask >> 64);
+
+        // Allocate Device Memory (Multiplying sizes by 2 to account for 64-bit chunks)
+        uint64_t *d_pi;
+        void *d_out_a_vec, *d_out_c_vec, *d_enc_qs; 
+        uint32_t *d_aes_round_keys;
+        // uint32_t *d_aes_round_keys;
+        // cudaMalloc(&d_aes_round_keys, 44 * sizeof(uint32_t));
+        // cudaMemcpy(d_aes_round_keys, crs.crs_aes_key.rd_key, 44 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+        cudaMalloc(&d_pi, index * sizeof(uint64_t));
+        cudaMalloc(&d_out_a_vec, total_coeffs_a * 2 * sizeof(uint64_t));
+        cudaMalloc(&d_out_c_vec, total_coeffs_c * 2 * sizeof(uint64_t));
+        cudaMalloc(&d_enc_qs, index * total_coeffs_c * 2 * sizeof(uint64_t));
+        cudaMalloc(&d_aes_round_keys, 44 * sizeof(uint32_t)); 
+
+        cudaMemset(d_out_a_vec, 0, total_coeffs_a * 2 * sizeof(uint64_t));
+        cudaMemset(d_out_c_vec, 0, total_coeffs_c * 2 * sizeof(uint64_t));
+        auto transfer_srt = std::chrono::high_resolution_clock::now();
+        cudaMemcpy(d_pi, flat_pi.data(), index * sizeof(uint64_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_enc_qs, flat_enc_qs.data(), index * total_coeffs_c * 2 * sizeof(uint64_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_aes_round_keys, crs.crs_aes_key.rd_key, 44 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+        // copy_aes_keys_to_constant(reinterpret_cast<const uint32_t*>(crs.crs_aes_key.rd_key));
+        // ---------------------------------------------------------
+        // 2. ADD THE END TRANSFER TIMER & START COMPUTE TIMER
+        auto transfer_end = std::chrono::high_resolution_clock::now();
+        auto gpu_compute_srt = std::chrono::high_resolution_clock::now();
+        // ---------------------------------------------------------
+        
+        // Launch c_vec accumulation
+        // --- SETUP TIMERS ---
+        cudaEvent_t start_c, stop_c, start_a, stop_a;
+        cudaEventCreate(&start_c); cudaEventCreate(&stop_c);
+        cudaEventCreate(&start_a); cudaEventCreate(&stop_a);
+
+        int threads_per_block = 256;
+        
+        // --- TIMING C_VEC ---
+        int blocks_c = total_coeffs_c; 
+        cudaEventRecord(start_c);
+        
+        launch_accumulate_c_vec_kernel(
+            d_enc_qs, d_pi, d_out_c_vec, index, total_coeffs_c, blocks_c, threads_per_block
+        );
+        
+        cudaEventRecord(stop_c);
+        cudaEventSynchronize(stop_c); // Force CPU to wait for GPU
+        
+        float milliseconds_c = 0;
+        cudaEventElapsedTime(&milliseconds_c, start_c, stop_c);
+        std::cout << "[PROFILER] c_vec accumulation took: " << milliseconds_c / 1000.0 << " seconds\n";
+
+        // --- TIMING A_VEC ---
+        int blocks_a = total_coeffs_a; 
+        cudaEventRecord(start_a);
+        
+        launch_generate_a_vec_kernel(
+            d_pi, d_out_a_vec, index, total_coeffs_a, blocks_a, threads_per_block, mod_mask_lo, mod_mask_hi, d_aes_round_keys
+        );
+        
+        cudaEventRecord(stop_a);
+        cudaEventSynchronize(stop_a); // Force CPU to wait for GPU
+        
+        float milliseconds_a = 0;
+        cudaEventElapsedTime(&milliseconds_a, start_a, stop_a);
+        std::cout << "[PROFILER] a_vec generation took: " << milliseconds_a / 1000.0 << " seconds\n";
+
+        // --- CLEANUP TIMERS ---
+        cudaEventDestroy(start_c); cudaEventDestroy(stop_c);
+        cudaEventDestroy(start_a); cudaEventDestroy(stop_a);
+
+
+
+        
+        cudaCheckError();
+
+        cudaDeviceSynchronize();
+        // ---------------------------------------------------------
+        // 3. ADD THE END COMPUTE TIMER
+        auto gpu_compute_end = std::chrono::high_resolution_clock::now();
+        // ---------------------------------------------------------
+        // Transfer Results Back to Host
+        std::vector<uint64_t> host_out_a_vec(total_coeffs_a * 2);
+        std::vector<uint64_t> host_out_c_vec(total_coeffs_c * 2);
+
+        cudaMemcpy(host_out_a_vec.data(), d_out_a_vec, total_coeffs_a * 2 * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(host_out_c_vec.data(), d_out_c_vec, total_coeffs_c * 2 * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+
+        // Reconstruct the 128-bit values back into the C++ classes
+        for(int i = 0; i < total_coeffs_a; i++) {
+            unsigned __int128 lo = host_out_a_vec[i * 2];
+            unsigned __int128 hi = host_out_a_vec[i * 2 + 1];
+            added.a_vec[i].value = (hi << 64) | lo;
+        }
+        for(int i = 0; i < total_coeffs_c; i++) {
+            unsigned __int128 lo = host_out_c_vec[i * 2];
+            unsigned __int128 hi = host_out_c_vec[i * 2 + 1];
+            added.c_vec[i].value = (hi << 64) | lo;
+        }
+
+        cudaFree(d_pi);
+        cudaFree(d_out_a_vec);
+        cudaFree(d_out_c_vec);
+        cudaFree(d_enc_qs);
+        cudaFree(d_aes_round_keys);
+
         using milli_s = std::chrono::milliseconds;
-        double rand_t = std::chrono::duration_cast<milli_s>(dur_rand).count(),
-               linear_t = std::chrono::duration_cast<milli_s>(dur_lin).count();
-        libff::leave_block("Generating a_vec linear combination");
+        double transfer_t = std::chrono::duration_cast<milli_s>(transfer_end - transfer_srt).count();
+        double compute_t = std::chrono::duration_cast<milli_s>(gpu_compute_end - gpu_compute_srt).count();
 
-        public_params_init<ppT, cpT>(original_prg, original_dg);
-        delete temp_dg;
-        delete temp_prg;
-
-#ifndef NOT_PROVABLE_ZK
+    #ifndef NOT_PROVABLE_ZK
+        // The public parameter is likely the CRS elements needed for blinding
         LWE::re_randomize(crs.public_parameter, added);
-#endif
+    #endif
+
+        // =========================================================
+        // DEBUG: ISOLATING THE CPU/GPU MISMATCH
+        // // =========================================================
+        
+        // // 1. Check the Linear Math (c_vec)
+        // unsigned __int128 cpu_c_vec_0 = 0;
+        // for(int i = 0; i < index; i++) {
+        //     cpu_c_vec_0 += (unsigned __int128)crs.enc_qs[i][0].value * (unsigned __int128)pi[i].value;
+        // }
+        // std::cout << "\n[DEBUG] CPU c_vec[0]: " << (uint64_t)(cpu_c_vec_0 >> 64) << " | " << (uint64_t)cpu_c_vec_0 << "\n";
+        // std::cout << "[DEBUG] GPU c_vec[0]: " << (uint64_t)(added.c_vec[0].value >> 64) << " | " << (uint64_t)added.c_vec[0].value << "\n";
+
+        // // 2. Check the AES Cryptography (a_vec)
+        // auto *check_prg = new LWERandomness::PseudoRandomGenerator(crs.crs_aes_key);
+        // unsigned __int128 cpu_a_vec_0 = 0;
+        // for(int i = 0; i < index; i++) {
+        //     // The CPU generates a block, but we only care about coeff 0
+        //     unsigned __int128 rand_val = check_prg->next_prg_block();
+            
+        //     // Fast-forward the PRG state past the rest of the polynomial
+        //     for(int j = 1; j < total_coeffs_a; j++) check_prg->next_prg_block();
+            
+        //     // The CPU applies a mask before multiplying!
+        //     rand_val = rand_val & (crs.enc_qs[0][0].mod - 1);
+            
+        //     cpu_a_vec_0 += rand_val * (unsigned __int128)pi[i].value;
+        // }
+        // delete check_prg;
+        
+        // std::cout << "[DEBUG] CPU a_vec[0]: " << (uint64_t)(cpu_a_vec_0 >> 64) << " | " << (uint64_t)cpu_a_vec_0 << "\n";
+        // std::cout << "[DEBUG] GPU a_vec[0]: " << (uint64_t)(added.a_vec[0].value >> 64) << " | " << (uint64_t)added.a_vec[0].value << "\n";
+        // // =========================================================
+
         added.rescale();
-        libff::leave_block("Generating response");
+        
+        libff::leave_block("Generating response (GPU Accelerated)");
 
         libff::leave_block("Call to r1cs lattice snark prover");
-        std::cout << "\n  * Randomize a_vec " +
-                         std::to_string((double) rand_t / 1000.0) + "s\n"
-                  << "  * Linear comb on a_vec " +
-                         std::to_string((double) linear_t / 1000.0) + "s\n"
-                  << "  * Linear comb size " + std::to_string(index)
-                  << std::endl;
+        
+        std::cout << "\n  * GPU Data Transfer: " + std::to_string(transfer_t / 1000.0) + "s\n"
+                << "  * GPU Computation: " + std::to_string(compute_t / 1000.0) + "s\n"
+                << "  * Linear comb size " + std::to_string(index)
+                << std::endl;
+
         return r1cs_lattice_snark_proof<ppT, cpT, Params>(std::move(added));
     }
 

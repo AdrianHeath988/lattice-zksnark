@@ -149,8 +149,54 @@ public:
             Fp_type::multiplicative_generator = Fp_type(gen);
             Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 54, 1811939329));
         }
+        // ==========================================
+        // NEW P LIMB GENERATORS (With 64-bit safety)
+        // ==========================================
+        else if constexpr (ParamsBase::p_int == 2013265921ULL) { // k = 60
+            constexpr uint64_t gen = get_generator(2013265921ULL, 2, 3, 5);
+            Fp_type::multiplicative_generator = Fp_type(gen);
+            Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 60, 2013265921ULL));
+        }
+        else if constexpr (ParamsBase::p_int == 2113929217ULL) { // k = 63
+            constexpr uint64_t gen = get_generator(2113929217ULL, 2, 3, 7);
+            Fp_type::multiplicative_generator = Fp_type(gen);
+            Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 63, 2113929217ULL));
+        }
+        else if constexpr (ParamsBase::p_int == 2281701377ULL) { // k = 68
+            constexpr uint64_t gen = get_generator(2281701377ULL, 2, 17, 0);
+            Fp_type::multiplicative_generator = Fp_type(gen);
+            Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 68, 2281701377ULL));
+        }
     }
 };
+
+template <typename ParamsBase>
+class Fp_b60_template_pp {
+public:
+    // THE ULTIMATE FIX: 128-bit storage prevents multiplication truncation!
+    using Fp_type = libsnark::Field<unsigned __int128, ParamsBase::p_int>;
+
+    static LWERandomness::PseudoRandomGenerator *prg;
+    static LWERandomness::DiscreteGaussian *dg;
+
+    static void init_public_params() {
+        Fp_type::prg = Fp_b60_template_pp<ParamsBase>::prg;
+        Fp_type::dg = Fp_b60_template_pp<ParamsBase>::dg;
+        
+        // Initialize the SNARK backend mathematically for your P prime
+        if constexpr (ParamsBase::p_int == 1152921504942391297ULL) { 
+            Fp_type::s = 60; // Because P = 2^60 + 1
+            Fp_type::multiplicative_generator = Fp_type(5);
+            Fp_type::root_of_unity = Fp_type(5);
+        }
+    }
+};
+
+// Ensure static members are allocated (just like they likely are for B28)
+template <typename ParamsBase> 
+LWERandomness::PseudoRandomGenerator* Fp_b60_template_pp<ParamsBase>::prg = nullptr;
+template <typename ParamsBase> 
+LWERandomness::DiscreteGaussian* Fp_b60_template_pp<ParamsBase>::dg = nullptr;
 
 template <typename ParamsBase>
 LWERandomness::PseudoRandomGenerator* Fp_b28_template_pp<ParamsBase>::prg = nullptr;
