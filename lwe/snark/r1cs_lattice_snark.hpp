@@ -244,7 +244,8 @@ namespace libsnark {
     r1cs_lattice_snark_proof<ppT, cpT, Params> r1cs_lattice_snark_prove(
         const r1cs_lattice_snark_crs<ppT, cpT, Params> &crs,
         const r1cs_primary_input<libff::Fr<ppT>> &primary_input,
-        const r1cs_auxiliary_input<libff::Fr<ppT>> &auxiliary_input) {
+        const r1cs_auxiliary_input<libff::Fr<ppT>> &auxiliary_input,
+        double* gpu_time_out = nullptr) {
         
         libff::enter_block("Call to r1cs lattice snark prover");
 
@@ -418,9 +419,13 @@ namespace libsnark {
         cudaFree(d_enc_qs);
         cudaFree(d_aes_round_keys);
 
-        using milli_s = std::chrono::milliseconds;
-        double transfer_t = std::chrono::duration_cast<milli_s>(transfer_end - transfer_srt).count();
-        double compute_t = std::chrono::duration_cast<milli_s>(gpu_compute_end - gpu_compute_srt).count();
+        using micro_s = std::chrono::microseconds;
+        double transfer_t = std::chrono::duration_cast<micro_s>(transfer_end - transfer_srt).count();
+        double compute_t = std::chrono::duration_cast<micro_s>(gpu_compute_end - gpu_compute_srt).count();
+
+        if (gpu_time_out) {
+            *gpu_time_out = (transfer_t + compute_t) / 1e6;  // seconds
+        }
 
     #ifndef NOT_PROVABLE_ZK
         // The public parameter is likely the CRS elements needed for blinding
@@ -466,8 +471,8 @@ namespace libsnark {
 
         libff::leave_block("Call to r1cs lattice snark prover");
         
-        std::cout << "\n  * GPU Data Transfer: " + std::to_string(transfer_t / 1000.0) + "s\n"
-                << "  * GPU Computation: " + std::to_string(compute_t / 1000.0) + "s\n"
+        std::cout << "\n  * GPU Data Transfer: " + std::to_string(transfer_t / 1e6) + "s\n"
+                << "  * GPU Computation: " + std::to_string(compute_t / 1e6) + "s\n"
                 << "  * Linear comb size " + std::to_string(index)
                 << std::endl;
 
