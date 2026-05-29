@@ -167,6 +167,40 @@ public:
             Fp_type::multiplicative_generator = Fp_type(gen);
             Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 68, 2281701377ULL));
         }
+        // ==========================================
+        // vFHE fork (B10): more Q-limb primes to fill out the L=14 chain
+        // matching the catalog's Q22_28..Q27_28 slots.
+        // ==========================================
+        else if constexpr (ParamsBase::p_int == 2483027969ULL) { // k = 74 = 2*37
+            constexpr uint64_t gen = get_generator(2483027969ULL, 2, 37, 0);
+            Fp_type::multiplicative_generator = Fp_type(gen);
+            Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 74, 2483027969ULL));
+        }
+        else if constexpr (ParamsBase::p_int == 2717908993ULL) { // k = 81 = 3^4
+            constexpr uint64_t gen = get_generator(2717908993ULL, 2, 3, 0);
+            Fp_type::multiplicative_generator = Fp_type(gen);
+            Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 81, 2717908993ULL));
+        }
+        else if constexpr (ParamsBase::p_int == 2885681153ULL) { // k = 86 = 2*43
+            constexpr uint64_t gen = get_generator(2885681153ULL, 2, 43, 0);
+            Fp_type::multiplicative_generator = Fp_type(gen);
+            Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 86, 2885681153ULL));
+        }
+        else if constexpr (ParamsBase::p_int == 3221225473ULL) { // k = 96 = 2^5*3
+            constexpr uint64_t gen = get_generator(3221225473ULL, 2, 3, 0);
+            Fp_type::multiplicative_generator = Fp_type(gen);
+            Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 96, 3221225473ULL));
+        }
+        else if constexpr (ParamsBase::p_int == 3489660929ULL) { // k = 104 = 2^3*13
+            constexpr uint64_t gen = get_generator(3489660929ULL, 2, 13, 0);
+            Fp_type::multiplicative_generator = Fp_type(gen);
+            Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 104, 3489660929ULL));
+        }
+        else if constexpr (ParamsBase::p_int == 3892314113ULL) { // k = 116 = 2^2*29
+            constexpr uint64_t gen = get_generator(3892314113ULL, 2, 29, 0);
+            Fp_type::multiplicative_generator = Fp_type(gen);
+            Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 116, 3892314113ULL));
+        }
     }
 };
 

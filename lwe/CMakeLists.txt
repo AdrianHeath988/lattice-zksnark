@@ -21,8 +21,8 @@ add_library(
         randomness/prg.hpp
         randomness/aes.hpp
 )
-set_target_properties(lwe_interface PROPERTIES 
-    CUDA_SEPARABLE_COMPILATION ON
+set_target_properties(lwe_interface PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
     POSITION_INDEPENDENT_CODE ON
 )
 # 3. Link the CUDA runtime PUBLICLY
