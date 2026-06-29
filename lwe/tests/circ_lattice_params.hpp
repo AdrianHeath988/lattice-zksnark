@@ -64,6 +64,21 @@ namespace LWE {
         static constexpr const uint32_t tau = 5;
         static constexpr const uint64_t p_int = 54 * (1 << 25) + 1;
     };
+    // vFHE: 6th 28-bit prover field, used as the prover-bound key-switching
+    // special prime P0_28 (= 2013265921 = 60*2^25+1). Its root_of_unity is
+    // already handled in common.hpp's Fp_b28_template_pp if-chain (k=60).
+    class B28FpParamsBase6 {
+    public:
+        static constexpr const uint32_t tau = 5;
+        static constexpr const uint64_t p_int = 60 * (1 << 25) + 1;
+    };
+    // vFHE: 7th 28-bit prover field (k=63), to deepen the prover-bound Q chain
+    // so a real depth-5 circuit (SobelFilter) has every limb provable.
+    class B28FpParamsBase7 {
+    public:
+        static constexpr const uint32_t tau = 5;
+        static constexpr const uint64_t p_int = 63 * (1 << 25) + 1;
+    };
 
 
     class B13C10 : public B13Fp2ParamsBase {
@@ -842,6 +857,30 @@ namespace LWE {
         static constexpr const uint32_t pt_dim = query_num * query_size;
         static constexpr const double width = 18.0;
     };
+    // vFHE: lattice params for the prover-bound special prime P0_28 (k=60).
+    class B28C15_6 : public B28FpParamsBase6 {
+    public:
+        static constexpr const uint32_t n = 4580;
+        static constexpr const uint64_t q_log = 122;
+        static constexpr const uint128_t q_int = (uint128_t) 1 << q_log;
+        static constexpr const uint128_t rescale_q = q_int;
+        static constexpr const uint32_t query_num = 12;
+        static constexpr const uint128_t b_int = 590679829335140766631067648_U128T;
+        static constexpr const uint32_t pt_dim = query_num * query_size;
+        static constexpr const double width = 18.0;
+    };
+    // vFHE: lattice params for the 6th prover-bound Q prime Q19_28 (k=63).
+    class B28C15_7 : public B28FpParamsBase7 {
+    public:
+        static constexpr const uint32_t n = 4580;
+        static constexpr const uint64_t q_log = 122;
+        static constexpr const uint128_t q_int = (uint128_t) 1 << q_log;
+        static constexpr const uint128_t rescale_q = q_int;
+        static constexpr const uint32_t query_num = 12;
+        static constexpr const uint128_t b_int = 590679829335140766631067648_U128T;
+        static constexpr const uint32_t pt_dim = query_num * query_size;
+        static constexpr const double width = 18.0;
+    };
     //END
     class B28C16 : public B28FpParamsBase {
     public:
@@ -902,6 +941,52 @@ namespace LWE {
         static constexpr const uint32_t pt_dim = query_num * query_size;
         static constexpr const double width = 34.0;
     };
+
+    // ==========================================================================
+    // vFHE big-int path: a 60-bit FHE limb (the Lattigo bootstrap-chain bottom
+    // prime q0 = catalog Q0_60). A 60-bit limb needs q_log ~140 > 128, so the
+    // SNARK ring is RingBig<uint256, q_log> on the CPU prover (is_big). q_int is
+    // nominal (the real modulus 2^q_log lives in RingBig; decrypt's q_int arg is
+    // ignored by Field::project_from(RingBig)). rescale_q = 0 => no rescale
+    // (matches the B*C15 identity-rescale). Use with Fp_b60_template_pp<B60FpParamsBase>
+    // and Ring_common_big_pp<B60Cbig::q_log>.
+    class B60FpParamsBase {
+    public:
+        static constexpr const uint32_t tau = 5;
+        // Q0_60: high-2-adicity 60-bit prime (p-1 = 2^40 * odd) so the SNARK QAP
+        // FFT domain (2^19 at N=2^15) fits. The plain largest-NTT-friendly 60-bit
+        // primes top out at 2-adicity ~18 and abort domain construction at N=2^15.
+        static constexpr const uint64_t p_int = 576475045954584577ULL;  // Q0_60
+    };
+    class B60Cbig : public B60FpParamsBase {
+    public:
+        // SECURITY: lattice-estimator (malb/lattice-estimator, sage) for the LWE
+        // instance n, q=2^q_log, secret&error = DiscreteGaussian(sigma=width/sqrt(2pi)):
+        //   q_log=150, width=18 (sigma~7.18): n=6144 -> lambda~112, n=8192 -> lambda~168
+        //   (LWE.estimate.rough). n=8192 gives >=128-bit with margin for the
+        //   rough-vs-conservative gap. b_int ~ q/(2*p_int) ~ 2^89 (decryption
+        //   correctness, not security). NOTE: functional validation (ToyMul N=2^15,
+        //   mul proven on every limb) was run at a smaller n for speed; this n is
+        //   the committed production value.
+        static constexpr const uint32_t n = 8192;  // estimator-derived (lambda~168); demos use a smaller n for speed
+        static constexpr const uint64_t q_log = 150;     // > 60 + B_proof(~60) + log2 n
+        static constexpr const uint128_t q_int = 0;      // nominal (RingBig holds 2^q_log)
+        static constexpr const uint128_t rescale_q = 0;  // sentinel: no rescale
+        static constexpr const uint32_t query_num = 12;
+        static constexpr const uint128_t b_int =
+            590679829335140766631067648_U128T;            // ~2^89 ~ q/(2*p_int) < 2^128
+        static constexpr const uint32_t pt_dim = query_num * query_size;
+        static constexpr const double width = 18.0;      // sigma = 18/sqrt(2pi) ~ 7.18
+    };
+
+    // ---- Bootstrap STAGE prime fields (Phase A3, plan.md) ----
+    // Auto-generated by tools/gen_stage_prover_fields.py from
+    // tools/bootstrap_stage_primes.txt. One pair per pinned bootstrap stage prime
+    // (CoeffsToSlots / EvalMod / SlotsToCoeffs / P). All use the big-int SNARK ring
+    // (q_int = 0 sentinel) like B60Cbig; shared security (n=8192, width=18,
+    // b_int~2^89), only q_log = bitsize+90 varies. The root-of-unity branch per
+    // prime is in common.hpp Fp_b60_template_pp::init_public_params.
+#include "stage_prover_fields.inc"
 
 }
 

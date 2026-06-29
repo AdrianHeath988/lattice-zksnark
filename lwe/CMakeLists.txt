@@ -11,7 +11,8 @@ add_library(
         snark/r1cs_lattice_snark_common.hpp
         snark/r1cs_lattice_snark.hpp
         snark/proof.cu
-        
+        snark/crs_gen.cu
+
         tests/common.hpp
         container/data_structure.hpp
         container/ring_base.hpp

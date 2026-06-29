@@ -266,13 +266,127 @@ void launch_accumulate_c_vec_kernel(
 }
 
 void launch_generate_a_vec_kernel(
-    const uint64_t* d_pi, void* d_out_a_vec, 
+    const uint64_t* d_pi, void* d_out_a_vec,
     int index, int total_coeffs_a, int blocks_a, int threads_per_block,
-    uint64_t mod_mask_lo, uint64_t mod_mask_hi, const uint32_t* d_aes_round_keys) 
+    uint64_t mod_mask_lo, uint64_t mod_mask_hi, const uint32_t* d_aes_round_keys)
 {
     generate_and_accumulate_a_vec<<<blocks_a, threads_per_block>>>(
         d_aes_round_keys, d_pi, (ulonglong2*)d_out_a_vec, index, total_coeffs_a, mod_mask_lo, mod_mask_hi
     );
+}
+
+// ============================================================================
+// Big-int (256-bit RingBig) prove kernels — the q_log>128 analog of the two
+// kernels above. enc_qs / out are 4x u64 (u256). Each response coefficient is
+// Sum_i element_i * pi[i] (mod 2^256); pi[i] is a field value < 2^64, so the MAC
+// is uint256::mul_u64 + operator+= (byte-exact via device unsigned __int128).
+// a_vec elements are regenerated on-device as TWO AES blocks (RingBig::
+// random_element), counter = i*2n + 2j (and +1), masked to q_log (4-limb).
+
+struct u256p { uint64_t w[4]; };
+
+__device__ inline void add256p(u256p* a, const u256p* b) {
+    unsigned __int128 c = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        unsigned __int128 s = (unsigned __int128)a->w[i] + b->w[i] + c;
+        a->w[i] = (uint64_t)s; c = s >> 64;
+    }
+}
+// accum += a * b  (b < 2^64); low 256 bits. == uint256::mul_u64 then operator+=.
+__device__ inline void mac256p(u256p* accum, const u256p* a, uint64_t b) {
+    u256p r; unsigned __int128 carry = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        unsigned __int128 p = (unsigned __int128)a->w[i] * b + carry;
+        r.w[i] = (uint64_t)p; carry = p >> 64;
+    }
+    add256p(accum, &r);
+}
+// a_vec element at element-counter c: two AES blocks (c, c+1), masked to q_log.
+__device__ inline u256p gen_a_elem_big(uint64_t c, const uint32_t* keys,
+                                       const uint8_t* sbox, uint64_t m0,
+                                       uint64_t m1, uint64_t m2, uint64_t m3) {
+    Block128 b0, b1;
+    b0.u64[0] = c;     b0.u64[1] = 0;
+    b1.u64[0] = c + 1; b1.u64[1] = 0;
+    AES_ecb_encrypt_blk_gpu(&b0, keys, sbox);
+    AES_ecb_encrypt_blk_gpu(&b1, keys, sbox);
+    u256p v;
+    v.w[0] = b0.u64[0] & m0;
+    v.w[1] = b0.u64[1] & m1;
+    v.w[2] = b1.u64[0] & m2;
+    v.w[3] = b1.u64[1] & m3;
+    return v;
+}
+
+__global__ void accumulate_c_vec_big(const uint64_t* __restrict__ enc_qs,
+                                     const uint64_t* __restrict__ pi,
+                                     uint64_t* __restrict__ out_c_vec,
+                                     int index, int total_coeffs) {
+    int coeff = blockIdx.x, tid = threadIdx.x;
+    __shared__ u256p sdata[256];
+    u256p acc = {0, 0, 0, 0};
+    for (int i = tid; i < index; i += blockDim.x) {
+        uint64_t base = ((uint64_t)i * total_coeffs + coeff) * 4;
+        u256p enc = {enc_qs[base], enc_qs[base + 1], enc_qs[base + 2], enc_qs[base + 3]};
+        mac256p(&acc, &enc, pi[i]);
+    }
+    sdata[tid] = acc;
+    __syncthreads();
+    for (unsigned s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && (tid + s) < blockDim.x) add256p(&sdata[tid], &sdata[tid + s]);
+        __syncthreads();
+    }
+    if (tid == 0) {
+        uint64_t o = (uint64_t)coeff * 4;
+        out_c_vec[o] = sdata[0].w[0]; out_c_vec[o+1] = sdata[0].w[1];
+        out_c_vec[o+2] = sdata[0].w[2]; out_c_vec[o+3] = sdata[0].w[3];
+    }
+}
+
+__global__ void generate_and_accumulate_a_vec_big(
+    const uint32_t* __restrict__ global_aes_keys, const uint64_t* __restrict__ pi,
+    uint64_t* __restrict__ out_a_vec, int index, int elements_per_poly,
+    uint64_t m0, uint64_t m1, uint64_t m2, uint64_t m3) {
+    int coeff = blockIdx.x, tid = threadIdx.x;
+    __shared__ u256p sdata[256];
+    __shared__ uint8_t s_sbox[256];
+    __shared__ uint32_t s_keys[44];
+    if (tid < 256) s_sbox[tid] = d_sbox[tid];
+    if (tid < 44) s_keys[tid] = global_aes_keys[tid];
+    __syncthreads();
+    u256p acc = {0, 0, 0, 0};
+    for (int i = tid; i < index; i += blockDim.x) {
+        uint64_t c = (uint64_t)i * 2 * elements_per_poly + 2 * (uint64_t)coeff;
+        u256p e = gen_a_elem_big(c, s_keys, s_sbox, m0, m1, m2, m3);
+        mac256p(&acc, &e, pi[i]);
+    }
+    sdata[tid] = acc;
+    __syncthreads();
+    for (unsigned s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && (tid + s) < blockDim.x) add256p(&sdata[tid], &sdata[tid + s]);
+        __syncthreads();
+    }
+    if (tid == 0) {
+        uint64_t o = (uint64_t)coeff * 4;
+        out_a_vec[o] = sdata[0].w[0]; out_a_vec[o+1] = sdata[0].w[1];
+        out_a_vec[o+2] = sdata[0].w[2]; out_a_vec[o+3] = sdata[0].w[3];
+    }
+}
+
+void launch_accumulate_c_vec_big(const uint64_t* d_enc_qs, const uint64_t* d_pi,
+                                 uint64_t* d_out_c_vec, int index, int total_coeffs,
+                                 int blocks_c, int threads_per_block) {
+    accumulate_c_vec_big<<<blocks_c, threads_per_block>>>(d_enc_qs, d_pi, d_out_c_vec,
+                                                          index, total_coeffs);
+}
+void launch_generate_a_vec_big(const uint64_t* d_pi, uint64_t* d_out_a_vec, int index,
+                               int total_coeffs_a, int blocks_a, int threads_per_block,
+                               uint64_t m0, uint64_t m1, uint64_t m2, uint64_t m3,
+                               const uint32_t* d_aes_round_keys) {
+    generate_and_accumulate_a_vec_big<<<blocks_a, threads_per_block>>>(
+        d_aes_round_keys, d_pi, d_out_a_vec, index, total_coeffs_a, m0, m1, m2, m3);
 }
 
 // Add this at the bottom of proof.cu
