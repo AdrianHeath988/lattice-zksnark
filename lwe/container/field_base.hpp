@@ -13,6 +13,10 @@ namespace libsnark {
     template <typename T, T modulus> class Field {
     public:
         T value;
+        // Expose the compile-time modulus so non-member code (e.g. the GPU QAP
+        // path) can read it generically as FieldT::mod without re-deriving the
+        // template non-type parameter.
+        static constexpr T mod = modulus;
         static Field multiplicative_generator;
         static Field root_of_unity;
         static size_t s;

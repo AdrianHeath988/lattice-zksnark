@@ -2,6 +2,7 @@
 #define __R1CS_LATTICE_SNARK__
 
 #include "r1cs_lattice_snark_common.hpp"
+#include "qap_gpu.hpp"
 #include <cuda_runtime.h>
 // --- ADD THIS AT THE TOP OF r1cs_lattice_snark.hpp ---
 // Standard C++ declarations that hide the CUDA launch syntax
@@ -138,31 +139,31 @@ namespace libsnark {
         C_prefix.resize(Params::query_num);
 
         libff::enter_block("Generating QAP queries");
-        size_t num_inputs = 0;
+        const size_t num_inputs = cs.num_inputs();
 
         auto t_s = reject_sampling_S(cs, Params::query_num);
-        for (size_t i = 0; i < Params::query_num; i++) {
-            qap_instance_evaluation<libff::Fr<ppT>> qap_inst =
-                r1cs_to_qap_instance_map_with_evaluation(cs, t_s[i]);
-            if (i == 0) {
-                libff::print_indent();
-                printf("* QAP number of variables: %zu\n",
-                       qap_inst.num_variables());
-                libff::print_indent();
-                printf("* QAP pre degree: %zu\n", cs.constraints.size());
-                libff::print_indent();
-                printf("* QAP degree: %zu\n", qap_inst.degree());
-                libff::print_indent();
-                printf("* QAP number of input variables: %zu\n",
-                       qap_inst.num_inputs());
 
-                num_inputs = qap_inst.num_inputs();
+        // GPU QAP instance map (opt-in via HECATE_QAP_GEN_GPU): fills A_qs/B_qs/
+        // C_qs/H_qs/Z_s bit-identically to the per-query CPU call below, but runs
+        // the sparse A/B/C evaluation (this loop's dominant cost) on the GPU. The
+        // Lagrange vector is still computed on the CPU (exact for every domain),
+        // so it is domain-independent. Falls back to the CPU path on any failure.
+        bool gpu_qap = false;
+        const char *qgpu_env = std::getenv("HECATE_QAP_GEN_GPU");
+        if (qgpu_env && qgpu_env[0] != '0' && qgpu_env[0] != '\0') {
+            gpu_qap = qap_instance_map_gpu<libff::Fr<ppT>>(
+                cs, t_s, A_qs, B_qs, C_qs, H_qs, Z_s);
+        }
+        for (size_t i = 0; i < Params::query_num; i++) {
+            if (!gpu_qap) {
+                qap_instance_evaluation<libff::Fr<ppT>> qap_inst =
+                    r1cs_to_qap_instance_map_with_evaluation(cs, t_s[i]);
+                A_qs[i] = std::move(qap_inst.At);
+                B_qs[i] = std::move(qap_inst.Bt);
+                C_qs[i] = std::move(qap_inst.Ct);
+                H_qs[i] = std::move(qap_inst.Ht);
+                Z_s[i] = qap_inst.Zt;
             }
-            A_qs[i] = std::move(qap_inst.At);
-            B_qs[i] = std::move(qap_inst.Bt);
-            C_qs[i] = std::move(qap_inst.Ct);
-            H_qs[i] = std::move(qap_inst.Ht);
-            Z_s[i] = qap_inst.Zt;
             A_prefix[i].reserve(num_inputs + 1);
             std::copy_n(std::begin(A_qs[i]), num_inputs + 1,
                         std::begin(A_prefix[i]));
@@ -316,13 +317,49 @@ namespace libsnark {
         delete temp_dg;
         delete temp_prg;
 
-        const qap_witness<libff::Fr<ppT>> qap_wit = r1cs_to_qap_witness_map(
-            crs.constraint_system, primary_input, auxiliary_input, d1, d2, d3);
-        libff::leave_block("Compute H polynomial");
-
+        // GPU QAP witness map (opt-in via HECATE_QAP_GPU). The witness map is
+        // ring-independent (it is purely over the SNARK field), so both ring
+        // paths can use it. Returns false (CPU fallback) for FFT domains we
+        // don't replicate exactly; results are always bit-identical to the CPU
+        // path. For the native uint64 ring the device pi feeds the response
+        // kernels directly (no host round-trip); for the big-int ring the pi is
+        // materialised to host for the CPU response generator.
+        void *d_pi_qap = nullptr;
+        size_t qap_dim = 0;
+        bool used_gpu_qap = false;
+        bool gpu_pi_on_device = false;
         libff::Fr_vector<ppT> pi;
-        prepare_pi_proof<ppT>(qap_wit, pi);
-        assert(pi.size() == crs.enc_qs->size());
+        if (std::getenv("HECATE_QAP_GPU")) {
+            std::vector<libff::Fr<ppT>> full_assignment = primary_input;
+            full_assignment.insert(full_assignment.end(),
+                                   auxiliary_input.begin(),
+                                   auxiliary_input.end());
+            used_gpu_qap = qap_witness_map_gpu<libff::Fr<ppT>>(
+                crs.constraint_system, full_assignment, d1, d2, d3, &d_pi_qap,
+                &qap_dim);
+        }
+        if (used_gpu_qap) {
+            if constexpr (cpT::is_big) {
+                // materialise device pi -> host pi for the CPU big-int response
+                using HostT = decltype(libff::Fr<ppT>::value);
+                std::vector<HostT> tmp(qap_dim);
+                cudaMemcpy(tmp.data(), d_pi_qap, qap_dim * sizeof(HostT),
+                           cudaMemcpyDeviceToHost);
+                pi.resize(qap_dim);
+                for (size_t i = 0; i < qap_dim; ++i) pi[i].value = tmp[i];
+                cudaFree(d_pi_qap);
+                d_pi_qap = nullptr;
+            } else {
+                gpu_pi_on_device = true; // response kernels consume d_pi_qap
+            }
+        } else {
+            const qap_witness<libff::Fr<ppT>> qap_wit = r1cs_to_qap_witness_map(
+                crs.constraint_system, primary_input, auxiliary_input, d1, d2,
+                d3);
+            prepare_pi_proof<ppT>(qap_wit, pi);
+            assert(pi.size() == crs.enc_qs.size());
+        }
+        libff::leave_block("Compute H polynomial");
 
         libff::enter_block("Generating response (GPU Accelerated)");
 
@@ -418,12 +455,18 @@ namespace libsnark {
             }
         }
 
-        std::vector<uint64_t> flat_pi(index);
-        uint64_t* pi_ptr = flat_pi.data();
-        
-        #pragma omp parallel for
-        for(int i = 0; i < index; i++) {
-            pi_ptr[i] = pi[i].value; 
+        std::vector<uint64_t> flat_pi;
+        if (!used_gpu_qap) {
+            flat_pi.resize(index);
+            uint64_t* pi_ptr = flat_pi.data();
+
+            #pragma omp parallel for
+            for(int i = 0; i < index; i++) {
+                pi_ptr[i] = pi[i].value;
+            }
+        } else if (qap_dim != (size_t)index) {
+            throw std::runtime_error(
+                "qap_witness_map_gpu: proof_dim != enc_qs size");
         }
 
         // Extract Mask
@@ -438,7 +481,12 @@ namespace libsnark {
         // uint32_t *d_aes_round_keys;
         // cudaMalloc(&d_aes_round_keys, 44 * sizeof(uint32_t));
         // cudaMemcpy(d_aes_round_keys, crs.crs_aes_key.rd_key, 44 * sizeof(uint32_t), cudaMemcpyHostToDevice);
-        cudaMalloc(&d_pi, index * sizeof(uint64_t));
+        // When the GPU QAP path ran, pi is already resident on the device
+        // (d_pi_qap); reuse it directly instead of allocating + uploading.
+        if (used_gpu_qap)
+            d_pi = reinterpret_cast<uint64_t *>(d_pi_qap);
+        else
+            cudaMalloc(&d_pi, index * sizeof(uint64_t));
         cudaMalloc(&d_out_a_vec, total_coeffs_a * 2 * sizeof(uint64_t));
         cudaMalloc(&d_out_c_vec, total_coeffs_c * 2 * sizeof(uint64_t));
         cudaMalloc(&d_enc_qs, static_cast<std::size_t>(index) * total_coeffs_c * 2 * sizeof(uint64_t));
@@ -447,7 +495,8 @@ namespace libsnark {
         cudaMemset(d_out_a_vec, 0, total_coeffs_a * 2 * sizeof(uint64_t));
         cudaMemset(d_out_c_vec, 0, total_coeffs_c * 2 * sizeof(uint64_t));
         auto transfer_srt = std::chrono::high_resolution_clock::now();
-        cudaMemcpy(d_pi, flat_pi.data(), index * sizeof(uint64_t), cudaMemcpyHostToDevice);
+        if (!used_gpu_qap)
+            cudaMemcpy(d_pi, flat_pi.data(), index * sizeof(uint64_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_enc_qs, flat_enc_qs.data(), static_cast<std::size_t>(index) * total_coeffs_c * 2 * sizeof(uint64_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_aes_round_keys, crs.crs_aes_key.rd_key, 44 * sizeof(uint32_t), cudaMemcpyHostToDevice);
         // copy_aes_keys_to_constant(reinterpret_cast<const uint32_t*>(crs.crs_aes_key.rd_key));

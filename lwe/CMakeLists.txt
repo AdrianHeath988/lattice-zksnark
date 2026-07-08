@@ -10,8 +10,10 @@ add_library(
         lwe_params.hpp
         snark/r1cs_lattice_snark_common.hpp
         snark/r1cs_lattice_snark.hpp
+        snark/qap_gpu.hpp
         snark/proof.cu
         snark/crs_gen.cu
+        snark/qap_gpu.cu
 
         tests/common.hpp
         container/data_structure.hpp
@@ -39,6 +41,11 @@ target_include_directories(
 )
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY bin)
+
+# GPU QAP witness-map determinism test (GPU pi == CPU pi)
+add_executable(test_qap_gpu tests/SNARK/test_qap_gpu.cpp)
+target_link_libraries(test_qap_gpu lwe_interface)
+
 
 # # add_executable(r1cs_lattice_snark_prime19_test tests/SNARK/test_r1cs_lattice_snark_p19.cpp)
 
