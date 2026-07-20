@@ -79,6 +79,27 @@ namespace LWE {
         static constexpr const uint32_t tau = 5;
         static constexpr const uint64_t p_int = 63 * (1 << 25) + 1;
     };
+    // vFHE: 8th/9th 28-bit prover fields (k=68, k=74). The Q chain is now selected
+    // as the TIGHT 2^30.04..2^31.21 cluster whose real size matches the catalog's
+    // rescaling_factor (=30) -- a rescale divides by the real prime, so a chain of
+    // mismatched sizes bleeds scale on every rescale. That cluster's last two members
+    // (2281701377, 2483027969) had no prover field, leaving 2 of 6 limbs unprovable.
+    // Fp_b28_template_pp already knows both primes' generator/root_of_unity (the
+    // k=68 and k=74 arms of its if-chain), so only the params classes were missing.
+    // NOTE the 64-bit literals: the k<=63 bases above can write `k * (1 << 25) + 1`
+    // because `1 << 25` is a signed int and k*2^25 still fits INT_MAX (63*2^25 =
+    // 2113929216 < 2^31-1). From k=68 up it does NOT (68*2^25 = 2281701376), so the
+    // int32 multiply overflows and the expression stops being constant. Use ULL.
+    class B28FpParamsBase8 {
+    public:
+        static constexpr const uint32_t tau = 5;
+        static constexpr const uint64_t p_int = 68ULL * (1ULL << 25) + 1;  // 2281701377, 2adic 27
+    };
+    class B28FpParamsBase9 {
+    public:
+        static constexpr const uint32_t tau = 5;
+        static constexpr const uint64_t p_int = 74ULL * (1ULL << 25) + 1;  // 2483027969, 2adic 26
+    };
 
 
     class B13C10 : public B13Fp2ParamsBase {
@@ -871,6 +892,36 @@ namespace LWE {
     };
     // vFHE: lattice params for the 6th prover-bound Q prime Q19_28 (k=63).
     class B28C15_7 : public B28FpParamsBase7 {
+    public:
+        static constexpr const uint32_t n = 4580;
+        static constexpr const uint64_t q_log = 122;
+        static constexpr const uint128_t q_int = (uint128_t) 1 << q_log;
+        static constexpr const uint128_t rescale_q = q_int;
+        static constexpr const uint32_t query_num = 12;
+        static constexpr const uint128_t b_int = 590679829335140766631067648_U128T;
+        static constexpr const uint32_t pt_dim = query_num * query_size;
+        static constexpr const double width = 18.0;
+    };
+    // vFHE: lattice params for the last two primes of the rescaling-factor-matched Q
+    // cluster (k=68 = 2281701377, k=74 = 2483027969). Identical LWE instance to
+    // B28C15_2..7 -- same n / q_log / query_num / width / b_int. That reuse is sound
+    // for these two: b_int is a DECRYPTION-CORRECTNESS bound (~q/(2*p_int)), and these
+    // primes sit only 0.11 and 0.23 bits above k=63, which already uses this b_int with
+    // margin -- b_int = 2^88.93 vs q/(2p) = 2^89.91 (k=68) and 2^89.79 (k=74), so both
+    // still clear it. n / q_log / width are the LWE security parameters and depend on
+    // the ring, not on p_int, so they carry over unchanged.
+    class B28C15_8 : public B28FpParamsBase8 {
+    public:
+        static constexpr const uint32_t n = 4580;
+        static constexpr const uint64_t q_log = 122;
+        static constexpr const uint128_t q_int = (uint128_t) 1 << q_log;
+        static constexpr const uint128_t rescale_q = q_int;
+        static constexpr const uint32_t query_num = 12;
+        static constexpr const uint128_t b_int = 590679829335140766631067648_U128T;
+        static constexpr const uint32_t pt_dim = query_num * query_size;
+        static constexpr const double width = 18.0;
+    };
+    class B28C15_9 : public B28FpParamsBase9 {
     public:
         static constexpr const uint32_t n = 4580;
         static constexpr const uint64_t q_log = 122;

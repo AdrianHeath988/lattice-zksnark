@@ -339,9 +339,18 @@ __global__ void accumulate_c_vec_big(const uint64_t* __restrict__ enc_qs,
         __syncthreads();
     }
     if (tid == 0) {
+        // ACCUMULATE (was overwrite): out_c_vec is memset to 0 once by the host,
+        // then this kernel is launched ONCE PER ROW-CHUNK (each with a chunk-local
+        // enc_qs/pi and index = chunk size), so a large enc_qs (e.g. the 2^25
+        // rotate/relin key-switch, ~53 GB > an L40S's 46 GB) never has to be resident
+        // in full. Only block `coeff` writes out_c_vec[coeff], and chunk launches are
+        // serialized on the default stream, so += needs no atomic. Single-shot callers
+        // (index = full) are unaffected: 0 + full sum == full sum.
         uint64_t o = (uint64_t)coeff * 4;
-        out_c_vec[o] = sdata[0].w[0]; out_c_vec[o+1] = sdata[0].w[1];
-        out_c_vec[o+2] = sdata[0].w[2]; out_c_vec[o+3] = sdata[0].w[3];
+        u256p cur = {out_c_vec[o], out_c_vec[o+1], out_c_vec[o+2], out_c_vec[o+3]};
+        add256p(&cur, &sdata[0]);
+        out_c_vec[o] = cur.w[0]; out_c_vec[o+1] = cur.w[1];
+        out_c_vec[o+2] = cur.w[2]; out_c_vec[o+3] = cur.w[3];
     }
 }
 

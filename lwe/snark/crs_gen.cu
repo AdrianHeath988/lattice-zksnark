@@ -137,7 +137,8 @@ __global__ void crs_encrypt_kernel(const u128 *__restrict__ S_T,  // [cdim*n]
                                    const uint64_t *__restrict__ uv, // [rows*cdim]
                                    const uint32_t *__restrict__ aes_keys, // [44]
                                    u128 *__restrict__ enc_qs,       // [rows*cdim]
-                                   uint64_t rows, uint32_t n, uint32_t cdim,
+                                   uint64_t rows, uint64_t row_offset,
+                                   uint32_t n, uint32_t cdim,
                                    uint64_t mask_lo, uint64_t mask_hi) {
   extern __shared__ u128 a_sh[];
   __shared__ uint32_t s_keys[44];
@@ -148,7 +149,10 @@ __global__ void crs_encrypt_kernel(const u128 *__restrict__ S_T,  // [cdim*n]
   __syncthreads();
 
   for (uint64_t row = blockIdx.x; row < rows; row += gridDim.x) {
-    const uint64_t base = row * (uint64_t)n;
+    // AES a_vec counter keys off the ABSOLUTE row index so row-chunked launches
+    // (row_offset>0, uv/enc_qs indexed chunk-locally) are byte-identical to a
+    // single-shot launch (row_offset=0). Mirrors crs_encrypt_kernel_big.
+    const uint64_t base = (row_offset + row) * (uint64_t)n;
     for (uint32_t k = tid; k < n; k += blockDim.x)
       a_sh[k] = aes_a_element(base + k, s_keys, s_sbox);
     __syncthreads();
@@ -240,7 +244,8 @@ __global__ void crs_encrypt_kernel_big(const u256 *__restrict__ S_T,   // [cdim*
                                        const uint64_t *__restrict__ uv, // [rows*cdim]
                                        const uint32_t *__restrict__ aes_keys,
                                        u256 *__restrict__ enc_qs,        // [rows*cdim]
-                                       uint64_t rows, uint32_t n, uint32_t cdim,
+                                       uint64_t rows, uint64_t row_offset,
+                                       uint32_t n, uint32_t cdim,
                                        uint32_t tile,
                                        uint64_t m0, uint64_t m1, uint64_t m2,
                                        uint64_t m3) {
@@ -255,7 +260,10 @@ __global__ void crs_encrypt_kernel_big(const u256 *__restrict__ S_T,   // [cdim*
 
   const bool own = (uint32_t)tid < cdim;
   for (uint64_t row = blockIdx.x; row < rows; row += gridDim.x) {
-    const uint64_t base = row * (uint64_t)n * 2;  // 2 AES blocks per a_vec element
+    // AES a_vec counter keys off the ABSOLUTE row index so row-chunked launches
+    // (row_offset>0, uv/enc_qs indexed chunk-locally) are byte-identical to a
+    // single-shot launch (row_offset=0).
+    const uint64_t base = (row_offset + row) * (uint64_t)n * 2;  // 2 AES blocks per a_vec element
     u256 acc;
     if (own) {
       acc.w[0] = uv[row * cdim + tid];  // lift(uv[out]) (field value < 2^64)
@@ -292,9 +300,19 @@ extern "C" int launch_crs_encrypt(const uint64_t *h_S_T, const uint64_t *h_uv,
                                   const uint32_t *h_keys, uint64_t rows, uint32_t n,
                                   uint32_t cdim, uint64_t mask_lo, uint64_t mask_hi,
                                   uint64_t *h_enc) {
-  const size_t st_elems = (size_t)cdim * n;          // u128 each
-  const size_t enc_elems = (size_t)rows * cdim;      // u128 each
-  const size_t uv_elems = (size_t)rows * cdim;       // u64 each
+  const size_t st_elems = (size_t)cdim * n;          // u128 each (row-independent)
+
+  // Chunk over ROWS so the per-chunk device working set (d_enc = rows*cdim*16B +
+  // d_uv = rows*cdim*8B) stays bounded. A single-shot d_enc OOMs a 46GB GPU once the
+  // key-switch circuits grow (blueprint Lq_pad=7 => ~15.6M constraints), which is
+  // exactly what the u256 path already guards against. Budget the enc+uv working set
+  // to ~10GB/chunk; d_S_T (cdim*n, row-independent) stays resident. The AES a_vec
+  // counter keys off the ABSOLUTE row index (row_offset), so the chunked result is
+  // byte-identical to a single-shot launch.
+  const size_t row_bytes = (size_t)cdim * (sizeof(u128) + sizeof(uint64_t));
+  size_t chunk_rows = (size_t)((10ULL << 30) / (row_bytes ? row_bytes : 1));
+  if (chunk_rows == 0) chunk_rows = 1;
+  if ((uint64_t)chunk_rows > rows) chunk_rows = (size_t)rows;
 
   u128 *d_S_T = nullptr, *d_enc = nullptr;
   uint64_t *d_uv = nullptr;
@@ -304,30 +322,40 @@ extern "C" int launch_crs_encrypt(const uint64_t *h_S_T, const uint64_t *h_uv,
     fprintf(stderr, "[crs_gen] %s: %s\n", #call, cudaGetErrorString(e)); goto fail; } } while (0)
 
   CK(cudaMalloc(&d_S_T, st_elems * sizeof(u128)));
-  CK(cudaMalloc(&d_uv, uv_elems * sizeof(uint64_t)));
+  CK(cudaMalloc(&d_uv, (size_t)chunk_rows * cdim * sizeof(uint64_t)));
   CK(cudaMalloc(&d_keys, 44 * sizeof(uint32_t)));
-  CK(cudaMalloc(&d_enc, enc_elems * sizeof(u128)));
+  CK(cudaMalloc(&d_enc, (size_t)chunk_rows * cdim * sizeof(u128)));
 
   CK(cudaMemcpy(d_S_T, h_S_T, st_elems * sizeof(u128), cudaMemcpyHostToDevice));
-  CK(cudaMemcpy(d_uv, h_uv, uv_elems * sizeof(uint64_t), cudaMemcpyHostToDevice));
   CK(cudaMemcpy(d_keys, h_keys, 44 * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
   {
     const int threads = 256;
-    // Cap grid; the kernel grid-strides over rows.
-    const int blocks = (int)((rows < 65535) ? rows : 65535);
     // a_vec lives in DYNAMIC shared memory (n u128). Opt into the larger per-block
     // shared limit (L40S allows up to ~99KB); n=4580 => ~72KB.
     const size_t shmem = (size_t)n * sizeof(u128);
     CK(cudaFuncSetAttribute(crs_encrypt_kernel,
                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem));
-    crs_encrypt_kernel<<<blocks, threads, shmem>>>(d_S_T, d_uv, d_keys, d_enc, rows,
-                                                   n, cdim, mask_lo, mask_hi);
-    CK(cudaGetLastError());
-    CK(cudaDeviceSynchronize());
+    // One row-chunk at a time; uv/enc are indexed chunk-locally, row_offset makes
+    // the AES stream absolute so the output matches an unchunked run bit-for-bit.
+    for (uint64_t off = 0; off < rows; off += chunk_rows) {
+      const uint64_t this_rows =
+          (rows - off < (uint64_t)chunk_rows) ? (rows - off) : (uint64_t)chunk_rows;
+      CK(cudaMemcpy(d_uv, h_uv + off * cdim,
+                    (size_t)this_rows * cdim * sizeof(uint64_t),
+                    cudaMemcpyHostToDevice));
+      // Cap grid; the kernel grid-strides over rows.
+      const int blocks = (int)((this_rows < 65535) ? this_rows : 65535);
+      crs_encrypt_kernel<<<blocks, threads, shmem>>>(d_S_T, d_uv, d_keys, d_enc,
+                                                     this_rows, off, n, cdim,
+                                                     mask_lo, mask_hi);
+      CK(cudaGetLastError());
+      CK(cudaDeviceSynchronize());
+      CK(cudaMemcpy(h_enc + off * cdim * 2, d_enc,
+                    (size_t)this_rows * cdim * sizeof(u128),
+                    cudaMemcpyDeviceToHost));
+    }
   }
-
-  CK(cudaMemcpy(h_enc, d_enc, enc_elems * sizeof(u128), cudaMemcpyDeviceToHost));
   e = cudaSuccess;
 fail:
   if (d_S_T) cudaFree(d_S_T);
@@ -349,9 +377,18 @@ extern "C" int launch_crs_encrypt_big(const uint64_t *h_S_T, const uint64_t *h_u
                                       uint32_t n, uint32_t cdim, uint64_t m0,
                                       uint64_t m1, uint64_t m2, uint64_t m3,
                                       uint64_t *h_enc) {
-  const size_t st_elems = (size_t)cdim * n;     // u256 each
-  const size_t enc_elems = (size_t)rows * cdim; // u256 each
-  const size_t uv_elems = (size_t)rows * cdim;  // u64 each
+  const size_t st_elems = (size_t)cdim * n;     // u256 each (fixed, not chunked)
+
+  // Chunk over ROWS so the per-chunk device working set (d_enc = rows*cdim*32B +
+  // d_uv = rows*cdim*8B) stays small. The full d_enc OOMs a 46GB GPU for the large
+  // key-switch circuits (60-bit q0 relin/rotate). Budget the enc+uv working set to
+  // ~10GB/chunk; d_S_T (cdim*n, row-independent) stays resident. The AES a_vec
+  // counter keys off the ABSOLUTE row index (row_offset), so the chunked result is
+  // byte-identical to a single-shot launch.
+  const size_t row_bytes = (size_t)cdim * (sizeof(u256) + sizeof(uint64_t));
+  size_t chunk_rows = (size_t)((10ULL << 30) / (row_bytes ? row_bytes : 1));
+  if (chunk_rows == 0) chunk_rows = 1;
+  if ((uint64_t)chunk_rows > rows) chunk_rows = (size_t)rows;
 
   u256 *d_S_T = nullptr, *d_enc = nullptr;
   uint64_t *d_uv = nullptr;
@@ -365,17 +402,15 @@ extern "C" int launch_crs_encrypt_big(const uint64_t *h_S_T, const uint64_t *h_u
     return -1;
   }
   CKB(cudaMalloc(&d_S_T, st_elems * sizeof(u256)));
-  CKB(cudaMalloc(&d_uv, uv_elems * sizeof(uint64_t)));
   CKB(cudaMalloc(&d_keys, 44 * sizeof(uint32_t)));
-  CKB(cudaMalloc(&d_enc, enc_elems * sizeof(u256)));
+  CKB(cudaMalloc(&d_uv, (size_t)chunk_rows * cdim * sizeof(uint64_t)));
+  CKB(cudaMalloc(&d_enc, (size_t)chunk_rows * cdim * sizeof(u256)));
 
   CKB(cudaMemcpy(d_S_T, h_S_T, st_elems * sizeof(u256), cudaMemcpyHostToDevice));
-  CKB(cudaMemcpy(d_uv, h_uv, uv_elems * sizeof(uint64_t), cudaMemcpyHostToDevice));
   CKB(cudaMemcpy(d_keys, h_keys, 44 * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
   {
     const int threads = 256;
-    const int blocks = (int)((rows < 65535) ? rows : 65535);
     // Tile a_vec to fit shared. Cap the tile so tile*32 bytes <= ~96KB; also no
     // larger than n.
     uint32_t tile = n;
@@ -384,13 +419,24 @@ extern "C" int launch_crs_encrypt_big(const uint64_t *h_S_T, const uint64_t *h_u
     const size_t shmem = (size_t)tile * sizeof(u256);
     CKB(cudaFuncSetAttribute(crs_encrypt_kernel_big,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem));
-    crs_encrypt_kernel_big<<<blocks, threads, shmem>>>(
-        d_S_T, d_uv, d_keys, d_enc, rows, n, cdim, tile, m0, m1, m2, m3);
-    CKB(cudaGetLastError());
-    CKB(cudaDeviceSynchronize());
+    // One row-chunk at a time; uv/enc are indexed chunk-locally, row_offset makes
+    // the AES stream absolute so the output matches an unchunked run bit-for-bit.
+    for (uint64_t off = 0; off < rows; off += chunk_rows) {
+      const uint64_t this_rows =
+          (rows - off < (uint64_t)chunk_rows) ? (rows - off) : (uint64_t)chunk_rows;
+      CKB(cudaMemcpy(d_uv, h_uv + off * cdim,
+                     (size_t)this_rows * cdim * sizeof(uint64_t),
+                     cudaMemcpyHostToDevice));
+      const int blocks = (int)((this_rows < 65535) ? this_rows : 65535);
+      crs_encrypt_kernel_big<<<blocks, threads, shmem>>>(
+          d_S_T, d_uv, d_keys, d_enc, this_rows, off, n, cdim, tile, m0, m1, m2, m3);
+      CKB(cudaGetLastError());
+      CKB(cudaDeviceSynchronize());
+      CKB(cudaMemcpy(h_enc + off * cdim * 4, d_enc,
+                     (size_t)this_rows * cdim * sizeof(u256),
+                     cudaMemcpyDeviceToHost));
+    }
   }
-
-  CKB(cudaMemcpy(h_enc, d_enc, enc_elems * sizeof(u256), cudaMemcpyDeviceToHost));
   e = cudaSuccess;
 failb:
   if (d_S_T) cudaFree(d_S_T);

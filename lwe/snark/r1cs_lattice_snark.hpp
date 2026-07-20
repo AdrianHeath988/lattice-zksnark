@@ -375,18 +375,18 @@ namespace libsnark {
           // (256-bit analog of the native kernels), else CPU. Byte-exact: the
           // device MAC is uint256::mul_u64 + operator+=, a_vec is the same two-
           // AES-block element as RingBig::random_element.
+          const int total_coeffs_c = Params::pt_dim + Params::tau;
+          const int total_coeffs_a = Params::n;
           if (std::getenv("HECATE_CRS_GPU")) {
-            const int total_coeffs_c = Params::pt_dim + Params::tau;
-            const int total_coeffs_a = Params::n;
-            std::vector<uint64_t> flat_enc_qs(
-                static_cast<std::size_t>(index) * total_coeffs_c * 4);
-            for (int i = 0; i < index; i++)
-              for (int j = 0; j < total_coeffs_c; j++) {
-                const auto &v = crs.enc_qs[i][j].value;  // T256
-                std::size_t b = (static_cast<std::size_t>(i) * total_coeffs_c + j) * 4;
-                flat_enc_qs[b] = v.w[0]; flat_enc_qs[b+1] = v.w[1];
-                flat_enc_qs[b+2] = v.w[2]; flat_enc_qs[b+3] = v.w[3];
-              }
+            // CHUNKED c_vec response. The enc_qs device mirror dominates GPU memory
+            // (index * total_coeffs_c * 32 B); a large QAP domain (the 2^25
+            // rotate/relin key-switch is ~53 GB) exceeds an L40S's 46 GB and the
+            // single-shot copy aborted with cudaErrorInvalidValue. So process enc_qs
+            // in ROW-CHUNKS — the same pattern crs_gen.cu already uses for keygen:
+            // accumulate_c_vec_big now adds into out_c_vec (memset to 0 once), and we
+            // stream at most `chunkRows` rows through a bounded d_enc. Byte-identical
+            // to the single-shot path. a_vec needs no enc_qs (it generates from AES +
+            // pi), so it stays a single launch over the full index.
             std::vector<uint64_t> flat_pi(index);
             for (int i = 0; i < index; i++) flat_pi[i] = (uint64_t)pi[i].value;
 
@@ -394,21 +394,48 @@ namespace libsnark {
             uint64_t m[4] = {0, 0, 0, 0};
             for (uint64_t b = 0; b < q_log && b < 256; b++) m[b >> 6] |= (1ull << (b & 63));
 
+            // Row budget: cap d_enc at ~8 GB so it fits any modern device with room
+            // for d_pi/d_out and page-cache pressure, regardless of the domain size.
+            const std::size_t bytes_per_row =
+                static_cast<std::size_t>(total_coeffs_c) * 4 * sizeof(uint64_t);
+            const std::size_t kEncBudget = std::size_t(8) << 30;  // 8 GB
+            int chunkRows = static_cast<int>(
+                std::max<std::size_t>(1, std::min<std::size_t>(
+                    static_cast<std::size_t>(index), kEncBudget / bytes_per_row)));
+
             uint64_t *d_pi, *d_enc, *d_outc, *d_outa;
             uint32_t *d_keys;
             cudaMalloc(&d_pi, (std::size_t)index * sizeof(uint64_t));
-            cudaMalloc(&d_enc, (std::size_t)index * total_coeffs_c * 4 * sizeof(uint64_t));
+            cudaMalloc(&d_enc, (std::size_t)chunkRows * bytes_per_row);
             cudaMalloc(&d_outc, total_coeffs_c * 4 * sizeof(uint64_t));
             cudaMalloc(&d_outa, total_coeffs_a * 4 * sizeof(uint64_t));
             cudaMalloc(&d_keys, 44 * sizeof(uint32_t));
             cudaMemset(d_outc, 0, total_coeffs_c * 4 * sizeof(uint64_t));
             cudaMemset(d_outa, 0, total_coeffs_a * 4 * sizeof(uint64_t));
             cudaMemcpy(d_pi, flat_pi.data(), (std::size_t)index * sizeof(uint64_t), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_enc, flat_enc_qs.data(),
-                       (std::size_t)index * total_coeffs_c * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
             cudaMemcpy(d_keys, crs.crs_aes_key.rd_key, 44 * sizeof(uint32_t), cudaMemcpyHostToDevice);
 
-            launch_accumulate_c_vec_big(d_enc, d_pi, d_outc, index, total_coeffs_c, total_coeffs_c, 256);
+            std::vector<uint64_t> flat_enc_qs(
+                static_cast<std::size_t>(chunkRows) * total_coeffs_c * 4);
+            for (int r0 = 0; r0 < index; r0 += chunkRows) {
+              const int rows = std::min(chunkRows, index - r0);
+              for (int i = 0; i < rows; i++)
+                for (int j = 0; j < total_coeffs_c; j++) {
+                  const auto &v = crs.enc_qs[r0 + i][j].value;  // T256
+                  std::size_t b = (static_cast<std::size_t>(i) * total_coeffs_c + j) * 4;
+                  flat_enc_qs[b] = v.w[0]; flat_enc_qs[b+1] = v.w[1];
+                  flat_enc_qs[b+2] = v.w[2]; flat_enc_qs[b+3] = v.w[3];
+                }
+              cudaMemcpy(d_enc, flat_enc_qs.data(),
+                         static_cast<std::size_t>(rows) * bytes_per_row,
+                         cudaMemcpyHostToDevice);
+              // pi is chunk-local via the offset pointer; enc_qs indexed [0,rows).
+              launch_accumulate_c_vec_big(d_enc, d_pi + r0, d_outc, rows,
+                                          total_coeffs_c, total_coeffs_c, 256);
+              cudaCheckError();
+              cudaDeviceSynchronize();
+            }
+            // a_vec: single launch over the full index (no enc_qs; d_pi = 256 MB).
             launch_generate_a_vec_big(d_pi, d_outa, index, total_coeffs_a, total_coeffs_a, 256,
                                       m[0], m[1], m[2], m[3], d_keys);
             cudaCheckError();
