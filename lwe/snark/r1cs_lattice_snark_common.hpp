@@ -7,11 +7,16 @@
 #include "lwe/randomness/aes.hpp"
 #include "lwe/randomness/prg.hpp"
 
+#include <cuda_runtime.h>
+
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
+#include <type_traits>
+#include <vector>
 #include <libff/algebra/curves/public_params.hpp>
 #include <libfqfft/evaluation_domain/get_evaluation_domain.hpp>
 #include <libsnark/reductions/r1cs_to_qap/r1cs_to_qap.hpp>
@@ -23,6 +28,87 @@ namespace libsnark {
     /* TYPE ALIAS DEFINITONS */
 
     template <typename cpT> using Rq_T = typename cpT::Rq_type;
+
+    /* TRI-STATE ENV FLAGS
+     *
+     * Optimizations (GPU keygen, GPU QAP, the CRS cache, the resident-key
+     * scheduler) ship ENABLED; the env var exists to turn them OFF for
+     * benchmarking and debugging. So the contract everywhere is:
+     *
+     *   unset            -> `def` (the shipped default, normally true)
+     *   "0"/"false"/"off"/"no"/""  -> false
+     *   anything else (incl. "1")  -> true
+     *
+     * Accepting "1" as ON keeps every existing script, README example and
+     * keygen shell wrapper working unchanged after the defaults flipped.
+     */
+    inline bool vfhe_env_on(const char *name, bool def) {
+        const char *e = std::getenv(name);
+        if (!e || !*e) return def;
+        return !(std::strcmp(e, "0") == 0 || std::strcmp(e, "false") == 0 ||
+                 std::strcmp(e, "off") == 0 || std::strcmp(e, "no") == 0);
+    }
+
+    // Is a CUDA device actually usable? Probed once. The GPU paths default ON, so
+    // this is what keeps a CPU-only host working without setting anything: no
+    // device (or no driver) simply routes back to the CPU implementation.
+    inline bool vfhe_gpu_available() {
+        static const bool ok = [] {
+            int n = 0;
+            return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
+        }();
+        return ok;
+    }
+
+    /* FLAT enc_qs ACCESS
+     *
+     * enc_qs IS the flat layout the GPU wants -- it never needs to be built.
+     * LWE::Vector<T,LEN> holds exactly one std::array<T,LEN>; Ring<u128,mod> and
+     * RingBig<u256,q_log> hold exactly one `value` (mod/MASK/prg/dg are static).
+     * So std::vector<LWE::Vector<Rq_T,cdim>> is byte-identical to the row-major
+     * [index][cdim] buffer accumulate_c_vec{,_big} reads -- little-endian u128 is
+     * (lo,hi), and uint256 is already w[0..3] in order. crs_wvec/crs_rvec write and
+     * read those same bytes, so the layout is flat end to end: keygen writes into
+     * it, the .crs file stores it, the loader memcpy's it back, and the prover
+     * cudaMemcpy's straight out of it. Re-flattening per proof rebuilt up to 6 GB
+     * of bit-identical data on the CPU for every proof sharing a key.
+     *
+     * The static_asserts are the guard: if a member is ever added to Vector or to
+     * the ring types, this stops compiling rather than silently uploading garbage.
+     */
+    template <typename T, uint64_t LEN>
+    inline constexpr void enc_qs_check_flat() {
+        static_assert(std::is_standard_layout<LWE::Vector<T, LEN>>::value,
+                      "enc_qs row must be standard-layout to alias as u64[]");
+        static_assert(sizeof(LWE::Vector<T, LEN>) == LEN * sizeof(T),
+                      "enc_qs row has padding -- not the flat device layout");
+        static_assert(sizeof(T) == sizeof(decltype(T::value)),
+                      "ring element is more than its value -- not flat");
+        static_assert(sizeof(T) % sizeof(uint64_t) == 0,
+                      "ring element is not a whole number of u64 limbs");
+    }
+
+    // u64 limbs per ring element (2 for the native u128 path, 4 for the u256 path).
+    template <typename T>
+    inline constexpr std::size_t enc_qs_limbs() {
+        return sizeof(T) / sizeof(uint64_t);
+    }
+
+    template <typename T, uint64_t LEN>
+    inline const uint64_t *
+    enc_qs_flat(const std::vector<LWE::Vector<T, LEN>> &enc_qs) {
+        enc_qs_check_flat<T, LEN>();
+        return enc_qs.empty()
+                   ? nullptr
+                   : reinterpret_cast<const uint64_t *>(enc_qs.data());
+    }
+
+    template <typename T, uint64_t LEN>
+    inline uint64_t *enc_qs_flat(std::vector<LWE::Vector<T, LEN>> &enc_qs) {
+        enc_qs_check_flat<T, LEN>();
+        return enc_qs.empty() ? nullptr
+                              : reinterpret_cast<uint64_t *>(enc_qs.data());
+    }
 
     template <typename ppT, uint32_t pt_dim>
     using r1cs_lattice_snark_query_matrix =
@@ -153,20 +239,13 @@ namespace libsnark {
         const uint64_t mask_hi =
             (q_log > 64) ? ((1ull << (q_log - 64)) - 1) : 0ull;
 
-        std::vector<uint64_t> hEnc((size_t)2 * rows * cdim);
+        // The kernel's h_enc layout ([row*cdim + out] -> (lo,hi)) is exactly
+        // enc_qs's own memory, so it D2H's straight into the CRS -- no staging
+        // buffer, no unflatten pass. enc_qs is flat from the moment it is written.
         int rc = launch_crs_encrypt(hS.data(), hUV.data(), keys, rows, n, cdim,
-                                    mask_lo, mask_hi, hEnc.data());
+                                    mask_lo, mask_hi, enc_qs_flat(enc_qs));
         if (rc != 0)
             throw std::runtime_error("launch_crs_encrypt failed");
-
-        for (uint64_t i = 0; i < rows; i++)
-            for (uint32_t out = 0; out < cdim; out++) {
-                const size_t idx = ((size_t)i * cdim + out) * 2;
-                unsigned __int128 lo = hEnc[idx];
-                unsigned __int128 hi = hEnc[idx + 1];
-                enc_qs[i][out].value =
-                    (decltype(enc_qs[i][out].value))((hi << 64) | lo);
-            }
     }
 
     // Big-int (256-bit RingBig) GPU encrypt loop (NOISELESS). Mirrors
@@ -208,19 +287,12 @@ namespace libsnark {
         uint64_t m[4] = {0, 0, 0, 0};
         for (uint64_t b = 0; b < q_log && b < 256; b++) m[b >> 6] |= (1ull << (b & 63));
 
-        std::vector<uint64_t> hEnc((size_t)4 * rows * cdim);
+        // As in the native path: h_enc ([row*cdim + out] -> w0..w3) is enc_qs's own
+        // memory, so the D2H lands directly in the CRS. No staging, no unflatten.
         int rc = launch_crs_encrypt_big(hS.data(), hUV.data(), keys, rows, n, cdim,
-                                        m[0], m[1], m[2], m[3], hEnc.data());
+                                        m[0], m[1], m[2], m[3], enc_qs_flat(enc_qs));
         if (rc != 0)
             throw std::runtime_error("launch_crs_encrypt_big failed");
-
-        for (uint64_t i = 0; i < rows; i++)
-            for (uint32_t out = 0; out < cdim; out++) {
-                const size_t idx = ((size_t)i * cdim + out) * 4;
-                auto &v = enc_qs[i][out].value;  // T256
-                v.w[0] = hEnc[idx + 0]; v.w[1] = hEnc[idx + 1];
-                v.w[2] = hEnc[idx + 2]; v.w[3] = hEnc[idx + 3];
-            }
     }
 
     template <typename ppT, typename cpT, class Params>
@@ -230,12 +302,19 @@ namespace libsnark {
         const LWERandomness::AES_KEY &crs_aes_key,
         std::vector<LWE::Vector<Rq_T<cpT>, Params::pt_dim + Params::tau>>
             &enc_qs) {
-        // Default = CPU. HECATE_CRS_GPU=1 uses the GPU keygen.
+        // Default = GPU keygen (~20x); HECATE_CRS_GPU=0 forces the CPU path.
         // HECATE_CRS_GPU_VALIDATE=1 runs BOTH (noiseless) and reports byte-exact
         // agreement, keeping the CPU result (the correctness gate before trusting
         // the GPU path on a multi-hour keygen). Both are native-params only.
+        //
+        // GPU is only ATTEMPTED when a usable device is present, and a launch
+        // failure falls back to the CPU path instead of propagating. That safety
+        // net is what makes on-by-default correct: this used to be opt-in, so a
+        // throw here could only happen to someone who had explicitly asked for
+        // the GPU. Now every CPU-only host reaches this code, and keygen must
+        // still complete for them.
         const bool validate = std::getenv("HECATE_CRS_GPU_VALIDATE") != nullptr;
-        const bool want_gpu = std::getenv("HECATE_CRS_GPU") != nullptr;
+        const bool want_gpu = vfhe_env_on("HECATE_CRS_GPU", true) && vfhe_gpu_available();
         if constexpr (!cpT::is_big) {
             if (validate) {
                 std::vector<
@@ -257,8 +336,21 @@ namespace libsnark {
                              "mismatch (keeping CPU)\n",
                              bad, total);
             } else if (want_gpu) {
-                encrypt_query_matrix_gpu<ppT, cpT, Params>(sk, q_mat, crs_aes_key,
-                                                           enc_qs);
+                try {
+                    encrypt_query_matrix_gpu<ppT, cpT, Params>(sk, q_mat,
+                                                               crs_aes_key, enc_qs);
+                } catch (const std::exception &ex) {
+                    // launch_crs_encrypt failed (OOM, no driver, ...). enc_qs may
+                    // be half-written, so drop it and redo on the CPU: a slower
+                    // keygen beats aborting the trusted setup.
+                    std::fprintf(stderr,
+                                 "[crs_gen] GPU keygen failed (%s) -- falling back "
+                                 "to CPU. Set HECATE_CRS_GPU=0 to skip this.\n",
+                                 ex.what());
+                    enc_qs.clear();
+                    encrypt_query_matrix_cpu<ppT, cpT, Params>(sk, q_mat,
+                                                               crs_aes_key, enc_qs);
+                }
             } else {
                 encrypt_query_matrix_cpu<ppT, cpT, Params>(sk, q_mat, crs_aes_key,
                                                            enc_qs);

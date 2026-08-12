@@ -4,6 +4,8 @@
 #include "r1cs_lattice_snark_common.hpp"
 #include "qap_gpu.hpp"
 #include <cuda_runtime.h>
+#include <algorithm>
+#include <functional>
 // --- ADD THIS AT THE TOP OF r1cs_lattice_snark.hpp ---
 // Standard C++ declarations that hide the CUDA launch syntax
 void launch_accumulate_c_vec_kernel(
@@ -36,6 +38,26 @@ void launch_generate_a_vec_big(const uint64_t* d_pi, uint64_t* d_out_a_vec, int 
                                int total_coeffs_a, int blocks_a, int threads_per_block,
                                uint64_t m0, uint64_t m1, uint64_t m2, uint64_t m3,
                                const uint32_t* d_aes_round_keys);
+
+// Split a_vec launchers (proof.cu): materialise A once, then MAC each trace's pi
+// against it. A is held TRANSPOSED, [coeff][row] -- see proof.cu. A chunk covers
+// rows [row0, row0+rows). See a_matrix_cache below for why the fused launchers
+// above are kept.
+void launch_generate_a_matrix(void* d_A, int rows, uint64_t row0, int total_coeffs_a,
+                              uint64_t mod_mask_lo, uint64_t mod_mask_hi,
+                              const uint32_t* d_aes_round_keys,
+                              cudaStream_t stream = 0);
+void launch_accumulate_a_vec_kernel(const void* d_A, const uint64_t* d_pi,
+                                    void* d_out_a_vec, int rows, int blocks_a,
+                                    int threads_per_block, cudaStream_t stream = 0);
+void launch_generate_a_matrix_big(uint64_t* d_A, int rows, uint64_t row0,
+                                  int total_coeffs_a, uint64_t m0, uint64_t m1,
+                                  uint64_t m2, uint64_t m3,
+                                  const uint32_t* d_aes_round_keys,
+                                  cudaStream_t stream = 0);
+void launch_accumulate_a_vec_big(const uint64_t* d_A, const uint64_t* d_pi,
+                                 uint64_t* d_out_a_vec, int rows, int blocks_a,
+                                 int threads_per_block, cudaStream_t stream = 0);
 
 // Forward declarations for your CUDA kernels
 template <typename DataType>
@@ -143,14 +165,15 @@ namespace libsnark {
 
         auto t_s = reject_sampling_S(cs, Params::query_num);
 
-        // GPU QAP instance map (opt-in via HECATE_QAP_GEN_GPU): fills A_qs/B_qs/
-        // C_qs/H_qs/Z_s bit-identically to the per-query CPU call below, but runs
-        // the sparse A/B/C evaluation (this loop's dominant cost) on the GPU. The
-        // Lagrange vector is still computed on the CPU (exact for every domain),
-        // so it is domain-independent. Falls back to the CPU path on any failure.
+        // GPU QAP instance map (ON by default; HECATE_QAP_GEN_GPU=0 disables):
+        // fills A_qs/B_qs/C_qs/H_qs/Z_s bit-identically to the per-query CPU call
+        // below, but runs the sparse A/B/C evaluation (this loop's dominant cost)
+        // on the GPU. The Lagrange vector is still computed on the CPU (exact for
+        // every domain), so it is domain-independent. qap_instance_map_gpu returns
+        // false on any unsupported domain or failure, and the loop below then does
+        // the CPU work -- that built-in fallback is why this is safe on by default.
         bool gpu_qap = false;
-        const char *qgpu_env = std::getenv("HECATE_QAP_GEN_GPU");
-        if (qgpu_env && qgpu_env[0] != '0' && qgpu_env[0] != '\0') {
+        if (vfhe_env_on("HECATE_QAP_GEN_GPU", true) && vfhe_gpu_available()) {
             gpu_qap = qap_instance_map_gpu<libff::Fr<ppT>>(
                 cs, t_s, A_qs, B_qs, C_qs, H_qs, Z_s);
         }
@@ -252,6 +275,157 @@ namespace libsnark {
         libff::leave_block("Prepare pi proof");
     }
 
+    // ---------------------------------------------------------------------
+    // RESIDENT a_vec MATRIX (A)
+    //
+    // A[i][j] = AES_k(i*n + j) & mask is a pure function of the CRS AES key and
+    // the dimensions -- no trace input enters it. The fused kernel therefore
+    // re-derived all index*n AES blocks on EVERY prove call, even though the
+    // prover server holds one CRS across a run of traces (the region path
+    // measured 1.97-4.05 proofs per CRS load, and the per-op path more), so that
+    // AES work was repeated verbatim per trace. With the kernel split in proof.cu
+    // we materialise A on the first proof under a key, MAC every later trace's pi
+    // straight out of it, and free it the moment the key or the shape changes.
+    //
+    // The constraint is size: A is index*n*sizeof(elem) bytes, which for a large
+    // QAP (index ~ 7M, n ~ 1.7k) is hundreds of GB -- past any device. So the
+    // cache is taken ONLY when the whole matrix fits in free device memory (and
+    // under HECATE_A_CACHE_MB, if set). Otherwise we keep the original fused
+    // generate+MAC kernel, which stores no A at all; for a single proof the split
+    // has nothing to win there anyway (the fused kernel already generates each
+    // element exactly once, one block per coefficient) and would only add a
+    // global-memory round trip. HECATE_A_CACHE=0 forces the fused path.
+    struct a_matrix_cache {
+        std::uint32_t keys[44] = {};
+        std::uint64_t mask[4] = {};
+        std::size_t rows = 0, coeffs = 0, elem_bytes = 0;
+        void *d_A = nullptr;
+        std::size_t capacity = 0;  // bytes actually allocated at d_A
+
+        bool matches(const std::uint32_t *k, const std::uint64_t *m, std::size_t r,
+                     std::size_t c, std::size_t eb) const {
+            return d_A != nullptr && rows == r && coeffs == c && elem_bytes == eb &&
+                   std::memcmp(keys, k, sizeof(keys)) == 0 &&
+                   std::memcmp(mask, m, sizeof(mask)) == 0;
+        }
+        // Forget WHAT is in the buffer, keep the buffer. A key change invalidates
+        // the contents but not the allocation, and at 9 GB the cudaMalloc costs
+        // ~0.29 s -- six times the refill itself -- so re-taking it per key would
+        // dominate everything the cache saves.
+        void invalidate() {
+            rows = coeffs = elem_bytes = 0;
+            std::memset(keys, 0, sizeof(keys));
+            std::memset(mask, 0, sizeof(mask));
+        }
+        void release() {
+            if (d_A) cudaFree(d_A);
+            d_A = nullptr;
+            capacity = 0;
+            invalidate();
+        }
+    };
+
+    inline a_matrix_cache &a_cache() {
+        // No destructor frees this: a static teardown cudaFree runs after the CUDA
+        // context may already be gone. The driver reclaims it at process exit.
+        static a_matrix_cache c;
+        return c;
+    }
+
+    // Device A for (key, mask, rows, coeffs), generated on a miss; nullptr when A
+    // cannot be held resident (caller then uses the fused kernel). Call AFTER the
+    // proof's other device allocations, so cudaMemGetInfo's `free` already nets
+    // them out -- a resident A has to coexist with them on every LATER proof too.
+    // `reserve_bytes` is what THIS proof's own device buffers occupy; the budget
+    // holds that much back again so a later, larger CRS can still allocate its
+    // enc_qs mirror next to a resident A.
+    inline void *a_matrix_acquire(const std::uint32_t *host_keys,
+                                  const std::uint64_t *mask, std::size_t rows,
+                                  std::size_t coeffs, bool big,
+                                  std::size_t reserve_bytes,
+                                  const std::uint32_t *d_aes_round_keys) {
+        if (!vfhe_env_on("HECATE_A_CACHE", true)) return nullptr;
+        const std::size_t elem_bytes = big ? 32 : 16;
+        a_matrix_cache &c = a_cache();
+        if (c.matches(host_keys, mask, rows, coeffs, elem_bytes)) return c.d_A;
+        // Miss. Drop the identity now so a failure below cannot leave a stale hit;
+        // whether the ALLOCATION survives is decided next.
+        c.invalidate();
+
+        if (rows == 0 || coeffs == 0) return nullptr;
+        // The fill puts the coefficient on grid dim y, which caps at 65535. Every
+        // Params::n in use is ~2-5k; a hypothetical larger one just takes the fused
+        // path rather than silently generating a short A.
+        if (coeffs > 65535) return nullptr;
+        const std::size_t count = rows * coeffs;
+        if (count / coeffs != rows) return nullptr;  // overflow
+        const std::size_t bytes = count * elem_bytes;
+        if (bytes / elem_bytes != count) return nullptr;
+
+        // Keep the existing buffer when the new A fits it without wasting more than
+        // half of it; that turns a key change into a refill with no cudaMalloc.
+        if (!(c.d_A && bytes <= c.capacity && bytes * 2 >= c.capacity)) {
+            c.release();
+            std::size_t free_b = 0, total_b = 0;
+            if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+                cudaGetLastError();
+                return nullptr;
+            }
+            const std::size_t slack =
+                std::max(std::size_t(512) << 20, reserve_bytes);
+            std::size_t budget = (free_b > slack) ? free_b - slack : 0;
+            if (const char *e = std::getenv("HECATE_A_CACHE_MB")) {
+                const std::size_t cap =
+                    static_cast<std::size_t>(std::strtoull(e, nullptr, 10)) << 20;
+                if (cap < budget) budget = cap;
+            }
+            if (bytes > budget) return nullptr;
+
+            void *p = nullptr;
+            if (cudaMalloc(&p, bytes) != cudaSuccess) {
+                cudaGetLastError();  // clear, so the caller's cudaCheckError() stays clean
+                return nullptr;
+            }
+            c.d_A = p;
+            c.capacity = bytes;
+        }
+        void *d_A = c.d_A;
+        const auto gen_srt = std::chrono::high_resolution_clock::now();
+        // row0 = 0: the cache always holds the whole matrix, rows [0, rows).
+        const int irows = static_cast<int>(rows), icoeffs = static_cast<int>(coeffs);
+        if (big)
+            launch_generate_a_matrix_big(reinterpret_cast<std::uint64_t *>(d_A), irows,
+                                         0, icoeffs, mask[0], mask[1], mask[2],
+                                         mask[3], d_aes_round_keys);
+        else
+            launch_generate_a_matrix(d_A, irows, 0, icoeffs, mask[0], mask[1],
+                                     d_aes_round_keys);
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            cudaGetLastError();
+            c.release();
+            return nullptr;
+        }
+        const double gen_s =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::high_resolution_clock::now() - gen_srt)
+                .count() / 1e6;
+        std::memcpy(c.keys, host_keys, sizeof(c.keys));
+        std::memcpy(c.mask, mask, sizeof(c.mask));
+        c.rows = rows;
+        c.coeffs = coeffs;
+        c.elem_bytes = elem_bytes;
+        std::cout << "[PROFILER] a_vec matrix A materialised in " << gen_s
+                  << " seconds (" << (bytes >> 20)
+                  << " MB resident): every later proof under this key MACs it "
+                     "instead of regenerating\n";
+        return d_A;
+    }
+
+    // Drop the resident A. Called when the sink evicts a CRS -- eviction happens
+    // under memory pressure, so holding A for a key that may not come back is
+    // exactly the wrong trade.
+    inline void release_a_matrix_cache() { a_cache().release(); }
+
     // CPU response generator for the big-int ring path (cpT::is_big), where the
     // SNARK modulus exceeds 128 bits and the native GPU kernels (uint128) don't
     // apply. Mirrors the GPU "Generating response" block:
@@ -329,7 +503,10 @@ namespace libsnark {
         bool used_gpu_qap = false;
         bool gpu_pi_on_device = false;
         libff::Fr_vector<ppT> pi;
-        if (std::getenv("HECATE_QAP_GPU")) {
+        // ON by default; HECATE_QAP_GPU=0 disables. qap_witness_map_gpu returns
+        // false for FFT domains it does not replicate exactly, so the CPU witness
+        // map below still runs -- the fallback is built into the contract.
+        if (vfhe_env_on("HECATE_QAP_GPU", true) && vfhe_gpu_available()) {
             std::vector<libff::Fr<ppT>> full_assignment = primary_input;
             full_assignment.insert(full_assignment.end(),
                                    auxiliary_input.begin(),
@@ -377,7 +554,13 @@ namespace libsnark {
           // AES-block element as RingBig::random_element.
           const int total_coeffs_c = Params::pt_dim + Params::tau;
           const int total_coeffs_a = Params::n;
-          if (std::getenv("HECATE_CRS_GPU")) {
+          // ON by default; HECATE_CRS_GPU=0 forces the CPU response generator.
+          // Unlike the keygen path there is no try/catch here: this block reports
+          // CUDA errors via cudaCheckError(), which exit()s rather than throwing,
+          // so the vfhe_gpu_available() probe is what protects a CPU-only host.
+          // A device that exists but fails mid-kernel still aborts, exactly as it
+          // did when this was opt-in.
+          if (vfhe_env_on("HECATE_CRS_GPU", true) && vfhe_gpu_available()) {
             // CHUNKED c_vec response. The enc_qs device mirror dominates GPU memory
             // (index * total_coeffs_c * 32 B); a large QAP domain (the 2^25
             // rotate/relin key-switch is ~53 GB) exceeds an L40S's 46 GB and the
@@ -415,18 +598,15 @@ namespace libsnark {
             cudaMemcpy(d_pi, flat_pi.data(), (std::size_t)index * sizeof(uint64_t), cudaMemcpyHostToDevice);
             cudaMemcpy(d_keys, crs.crs_aes_key.rd_key, 44 * sizeof(uint32_t), cudaMemcpyHostToDevice);
 
-            std::vector<uint64_t> flat_enc_qs(
-                static_cast<std::size_t>(chunkRows) * total_coeffs_c * 4);
+            // crs.enc_qs already IS the flat [index][total_coeffs_c] w[0..3]
+            // buffer (see enc_qs_flat), so a chunk is a contiguous byte range at
+            // r0 * bytes_per_row -- no per-chunk gather, no staging copy.
+            const uint64_t *enc_base = enc_qs_flat(crs.enc_qs);
             for (int r0 = 0; r0 < index; r0 += chunkRows) {
               const int rows = std::min(chunkRows, index - r0);
-              for (int i = 0; i < rows; i++)
-                for (int j = 0; j < total_coeffs_c; j++) {
-                  const auto &v = crs.enc_qs[r0 + i][j].value;  // T256
-                  std::size_t b = (static_cast<std::size_t>(i) * total_coeffs_c + j) * 4;
-                  flat_enc_qs[b] = v.w[0]; flat_enc_qs[b+1] = v.w[1];
-                  flat_enc_qs[b+2] = v.w[2]; flat_enc_qs[b+3] = v.w[3];
-                }
-              cudaMemcpy(d_enc, flat_enc_qs.data(),
+              cudaMemcpy(d_enc,
+                         reinterpret_cast<const char *>(enc_base) +
+                             static_cast<std::size_t>(r0) * bytes_per_row,
                          static_cast<std::size_t>(rows) * bytes_per_row,
                          cudaMemcpyHostToDevice);
               // pi is chunk-local via the offset pointer; enc_qs indexed [0,rows).
@@ -436,8 +616,20 @@ namespace libsnark {
               cudaDeviceSynchronize();
             }
             // a_vec: single launch over the full index (no enc_qs; d_pi = 256 MB).
-            launch_generate_a_vec_big(d_pi, d_outa, index, total_coeffs_a, total_coeffs_a, 256,
-                                      m[0], m[1], m[2], m[3], d_keys);
+            // With a resident A this proof pays only the MAC; a_matrix_acquire
+            // returns null when A will not fit and the fused kernel runs instead.
+            void *d_A = a_matrix_acquire(
+                reinterpret_cast<const std::uint32_t *>(crs.crs_aes_key.rd_key), m,
+                static_cast<std::size_t>(index),
+                static_cast<std::size_t>(total_coeffs_a), /*big=*/true,
+                /*reserve_bytes=*/static_cast<std::size_t>(chunkRows) * bytes_per_row,
+                d_keys);
+            if (d_A)
+              launch_accumulate_a_vec_big(reinterpret_cast<const uint64_t *>(d_A), d_pi,
+                                          d_outa, index, total_coeffs_a, 256);
+            else
+              launch_generate_a_vec_big(d_pi, d_outa, index, total_coeffs_a, total_coeffs_a, 256,
+                                        m[0], m[1], m[2], m[3], d_keys);
             cudaCheckError();
             cudaDeviceSynchronize();
 
@@ -465,22 +657,12 @@ namespace libsnark {
         // Fix 2: Extracted directly from the LWE::Vector<..., 53> error
         int total_coeffs_c = 53; 
 
-        // Flatten enc_qs for the GPU
-        // 1. Parallelize the heavy extraction loops
-        // index can exceed ~20M for large circuits (e.g. Lattigo relin at
-        // N=2^15), and index*total_coeffs_c*2 overflows int32; widen to size_t.
-        std::vector<uint64_t> flat_enc_qs(static_cast<std::size_t>(index) * total_coeffs_c * 2);
-        uint64_t* flat_qs_ptr = flat_enc_qs.data(); // Raw pointer for speed
-        
-        #pragma omp parallel for collapse(2)
-        for (int i = 0; i < index; i++) {
-            for (int j = 0; j < total_coeffs_c; j++) {
-                unsigned __int128 val = crs.enc_qs[i][j].value;
-                uint64_t base_idx = ((uint64_t)i * total_coeffs_c + j) * 2;
-                flat_qs_ptr[base_idx] = (uint64_t)val;
-                flat_qs_ptr[base_idx + 1] = (uint64_t)(val >> 64);
-            }
-        }
+        // enc_qs needs NO flattening: crs.enc_qs already IS the row-major
+        // [index][total_coeffs_c] (lo,hi) buffer the kernel reads (see
+        // enc_qs_flat). This used to rebuild a bit-identical index*53*16 B copy on
+        // the CPU for every proof -- 6.2 GB / ~7.5 s per proof at index = 7.27M,
+        // ~32% of the prover call, all of it redundant across proofs sharing a key.
+        const uint64_t* flat_qs_ptr = enc_qs_flat(crs.enc_qs);
 
         std::vector<uint64_t> flat_pi;
         if (!used_gpu_qap) {
@@ -524,7 +706,7 @@ namespace libsnark {
         auto transfer_srt = std::chrono::high_resolution_clock::now();
         if (!used_gpu_qap)
             cudaMemcpy(d_pi, flat_pi.data(), index * sizeof(uint64_t), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_enc_qs, flat_enc_qs.data(), static_cast<std::size_t>(index) * total_coeffs_c * 2 * sizeof(uint64_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_enc_qs, flat_qs_ptr, static_cast<std::size_t>(index) * total_coeffs_c * 2 * sizeof(uint64_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_aes_round_keys, crs.crs_aes_key.rd_key, 44 * sizeof(uint32_t), cudaMemcpyHostToDevice);
         // copy_aes_keys_to_constant(reinterpret_cast<const uint32_t*>(crs.crs_aes_key.rd_key));
         // ---------------------------------------------------------
@@ -557,13 +739,34 @@ namespace libsnark {
         std::cout << "[PROFILER] c_vec accumulation took: " << milliseconds_c / 1000.0 << " seconds\n";
 
         // --- TIMING A_VEC ---
-        int blocks_a = total_coeffs_a; 
+        int blocks_a = total_coeffs_a;
+        const std::uint64_t a_mask[4] = {mod_mask_lo, mod_mask_hi, 0, 0};
         cudaEventRecord(start_a);
-        
-        launch_generate_a_vec_kernel(
-            d_pi, d_out_a_vec, index, total_coeffs_a, blocks_a, threads_per_block, mod_mask_lo, mod_mask_hi, d_aes_round_keys
-        );
-        
+
+        // Try for a resident A first: on a hit this proof pays only the MAC, not
+        // the index*n AES blocks. a_matrix_acquire runs AFTER the allocations
+        // above on purpose (see its comment), and returns null when A will not
+        // fit, in which case the original fused kernel runs unchanged. It is
+        // inside the timed region so the a_vec number below stays honest: the
+        // first proof under a key pays the fill, later ones do not.
+        void *d_A = a_matrix_acquire(
+            reinterpret_cast<const std::uint32_t *>(crs.crs_aes_key.rd_key), a_mask,
+            static_cast<std::size_t>(index), static_cast<std::size_t>(total_coeffs_a),
+            /*big=*/false,
+            /*reserve_bytes=*/static_cast<std::size_t>(index) * total_coeffs_c * 2 *
+                sizeof(uint64_t),
+            d_aes_round_keys);
+
+        if (d_A) {
+            launch_accumulate_a_vec_kernel(
+                d_A, d_pi, d_out_a_vec, index, blocks_a, threads_per_block
+            );
+        } else {
+            launch_generate_a_vec_kernel(
+                d_pi, d_out_a_vec, index, total_coeffs_a, blocks_a, threads_per_block, mod_mask_lo, mod_mask_hi, d_aes_round_keys
+            );
+        }
+
         cudaEventRecord(stop_a);
         cudaEventSynchronize(stop_a); // Force CPU to wait for GPU
         
@@ -669,6 +872,354 @@ namespace libsnark {
                 << std::endl;
 
         return r1cs_lattice_snark_proof<ppT, cpT, Params>(std::move(added));
+    }
+
+    // =====================================================================
+    // BATCHED PROVER -- K traces against ONE key, proved together.
+    //
+    // WHY. The a_vec matrix A[i][j] = AES_k(i*n + j) & mask is a function of the
+    // key alone, so proving K traces one at a time re-derives the SAME index*n
+    // AES blocks K times. Here A is walked once in row-chunks and each chunk is
+    // MAC'd against all K pi vectors before it is discarded, so the AES is paid
+    // once per BATCH. Two chunk buffers on two streams overlap chunk c+1's fill
+    // with chunk c's MACs, making the cost max(fill_total, K*read_total) instead
+    // of their sum -- at the measured 204 GB/s fill and 678 GB/s resident read
+    // that is ~3.3x on a_vec by K=5, against a 3.4x asymptote.
+    //
+    // The enc_qs mirror is amortised for free by the same restructuring: it is
+    // uploaded ONCE and c_vec runs K times against it. That upload was measured
+    // at 2.2 s per proof at index 7.27M, so on the large keys it is the bigger
+    // half of the saving.
+    //
+    // HOST MEMORY stays flat in K: `fill` is invoked one trace at a time, so the
+    // caller's protoboard (multi-GB at relin sizes) can die before the next call.
+    // Only the K pi vectors survive into the batched phase, and those live on the
+    // DEVICE (index * 8 B each -- 48 MB at index 6.06M).
+    //
+    // EXACTNESS. Identical to K separate r1cs_lattice_snark_prove calls on the
+    // same witnesses: chunking A composes because the accumulators are mod 2^128
+    // (mod 2^256 for the big ring) and therefore associative, and every other
+    // step is per-trace and untouched.
+    //
+    // `fill(k, primary, auxiliary)` must populate the two vectors for trace k and
+    // return false to skip it. ok_out (optional, resized to `batch`) reports which
+    // traces produced a proof; skipped entries hold a default-constructed proof.
+    template <typename ppT, typename cpT, class Params>
+    std::vector<r1cs_lattice_snark_proof<ppT, cpT, Params>>
+    r1cs_lattice_snark_prove_batch(
+        const r1cs_lattice_snark_crs<ppT, cpT, Params> &crs, std::size_t batch,
+        const std::function<bool(std::size_t, r1cs_primary_input<libff::Fr<ppT>> &,
+                                 r1cs_auxiliary_input<libff::Fr<ppT>> &)> &fill,
+        std::vector<char> *ok_out = nullptr, double *gpu_time_out = nullptr) {
+
+        std::vector<r1cs_lattice_snark_proof<ppT, cpT, Params>> proofs(batch);
+        std::vector<char> ok(batch, 0);
+        auto finish = [&]() {
+            if (ok_out) *ok_out = ok;
+            return proofs;
+        };
+        if (batch == 0) return finish();
+
+        const int index = static_cast<int>(crs.enc_qs.size());
+        const int total_coeffs_a = Params::n;
+        const int total_coeffs_c = Params::pt_dim + Params::tau;
+
+        // Prove one at a time. The contract is unchanged, just unamortised.
+        auto prove_serially = [&]() {
+            for (std::size_t k = 0; k < batch; ++k) {
+                r1cs_primary_input<libff::Fr<ppT>> prim;
+                r1cs_auxiliary_input<libff::Fr<ppT>> aux;
+                if (!fill(k, prim, aux)) continue;
+                proofs[k] = r1cs_lattice_snark_prove<ppT, cpT, Params>(
+                    crs, prim, aux, gpu_time_out);
+                ok[k] = 1;
+            }
+        };
+
+        // The batched response generator is the uint128 GPU path only. The big-int
+        // ring runs a CPU response generator that materialises no A to share, and a
+        // CPU-only host has no kernels at all: both prove one at a time, exactly as
+        // before. if constexpr, so the big pp never instantiates the uint128 block.
+        if constexpr (cpT::is_big) {
+            prove_serially();
+            return finish();
+        } else {
+        if (!(vfhe_env_on("HECATE_CRS_GPU", true) && vfhe_gpu_available() &&
+              batch >= 2)) {
+            prove_serially();
+            return finish();
+        }
+
+        libff::enter_block("Call to r1cs lattice snark prover (batch)");
+        const auto t_start = std::chrono::high_resolution_clock::now();
+
+        // ---- PHASE 1: per trace, witness -> pi, straight into a device slab.
+        // One protoboard at a time upstream; here one pi at a time, D2D-copied into
+        // d_pi_all so the batched phase can index every trace's pi by offset.
+        uint64_t *d_pi_all = nullptr;
+        if (cudaMalloc(&d_pi_all, (std::size_t)batch * index * sizeof(uint64_t)) !=
+            cudaSuccess) {
+            cudaGetLastError();
+            libff::leave_block("Call to r1cs lattice snark prover (batch)");
+            // Out of room for K pi vectors: fall back rather than fail the batch.
+            prove_serially();
+            return finish();
+        }
+
+        libff::enter_block("Compute H polynomial (batch)");
+        std::vector<std::size_t> live;  // batch slots that produced a pi
+        for (std::size_t k = 0; k < batch; ++k) {
+            r1cs_primary_input<libff::Fr<ppT>> prim;
+            r1cs_auxiliary_input<libff::Fr<ppT>> aux;
+            if (!fill(k, prim, aux)) continue;
+
+            // Per-trace ZK blinding, exactly as the scalar prover draws it.
+            LWERandomness::AES_KEY _aes_key;
+            genAES_key(&_aes_key);
+            auto *temp_prg = new LWERandomness::PseudoRandomGenerator(_aes_key);
+            auto *temp_dg = new LWERandomness::DiscreteGaussian(
+                Params::width, LWE::expand, *temp_prg);
+            auto *original_prg = ppT::prg;
+            auto *original_dg = ppT::dg;
+            public_params_init<ppT, cpT>(temp_prg, temp_dg);
+            const libff::Fr<ppT> d1 = libff::Fr<ppT>::random_element(),
+                                 d2 = libff::Fr<ppT>::random_element(),
+                                 d3 = libff::Fr<ppT>::random_element();
+            public_params_init<ppT, cpT>(original_prg, original_dg);
+            delete temp_dg;
+            delete temp_prg;
+
+            uint64_t *slot = d_pi_all + (std::size_t)k * index;
+            void *d_pi_qap = nullptr;
+            std::size_t qap_dim = 0;
+            bool used_gpu_qap = false;
+            if (vfhe_env_on("HECATE_QAP_GPU", true)) {
+                std::vector<libff::Fr<ppT>> full_assignment = prim;
+                full_assignment.insert(full_assignment.end(), aux.begin(), aux.end());
+                used_gpu_qap = qap_witness_map_gpu<libff::Fr<ppT>>(
+                    crs.constraint_system, full_assignment, d1, d2, d3, &d_pi_qap,
+                    &qap_dim);
+            }
+            if (used_gpu_qap) {
+                if (static_cast<int>(qap_dim) != index) {
+                    cudaFree(d_pi_qap);
+                    throw std::runtime_error(
+                        "qap_witness_map_gpu: proof_dim != enc_qs size");
+                }
+                cudaMemcpy(slot, d_pi_qap, (std::size_t)index * sizeof(uint64_t),
+                           cudaMemcpyDeviceToDevice);
+                cudaFree(d_pi_qap);
+            } else {
+                const qap_witness<libff::Fr<ppT>> qap_wit = r1cs_to_qap_witness_map(
+                    crs.constraint_system, prim, aux, d1, d2, d3);
+                libff::Fr_vector<ppT> pi;
+                prepare_pi_proof<ppT>(qap_wit, pi);
+                assert(static_cast<int>(pi.size()) == index);
+                std::vector<uint64_t> flat(index);
+#pragma omp parallel for
+                for (int i = 0; i < index; i++) flat[i] = (uint64_t)pi[i].value;
+                cudaMemcpy(slot, flat.data(), (std::size_t)index * sizeof(uint64_t),
+                           cudaMemcpyHostToDevice);
+            }
+            live.push_back(k);
+        }
+        libff::leave_block("Compute H polynomial (batch)");
+        if (live.empty()) {
+            cudaFree(d_pi_all);
+            libff::leave_block("Call to r1cs lattice snark prover (batch)");
+            return finish();
+        }
+
+        // ---- PHASE 2: one pass over the key, K accumulations per pass.
+        libff::enter_block("Generating response (batch, GPU)");
+        const int K = static_cast<int>(live.size());
+        const int threads = 256;
+
+        unsigned __int128 mask = crs.enc_qs[0][0].mod - 1;
+        const uint64_t mod_mask_lo = (uint64_t)mask;
+        const uint64_t mod_mask_hi = (uint64_t)(mask >> 64);
+
+        void *d_enc_qs = nullptr, *d_out_a = nullptr, *d_out_c = nullptr;
+        uint32_t *d_keys = nullptr;
+        const std::size_t enc_bytes =
+            (std::size_t)index * total_coeffs_c * 2 * sizeof(uint64_t);
+        cudaMalloc(&d_enc_qs, enc_bytes);
+        cudaMalloc(&d_out_a, (std::size_t)K * total_coeffs_a * 2 * sizeof(uint64_t));
+        cudaMalloc(&d_out_c, (std::size_t)K * total_coeffs_c * 2 * sizeof(uint64_t));
+        cudaMalloc(&d_keys, 44 * sizeof(uint32_t));
+        cudaMemset(d_out_a, 0, (std::size_t)K * total_coeffs_a * 2 * sizeof(uint64_t));
+        cudaMemset(d_out_c, 0, (std::size_t)K * total_coeffs_c * 2 * sizeof(uint64_t));
+
+        const auto transfer_srt = std::chrono::high_resolution_clock::now();
+        // ONE upload for the whole batch -- the amortisation the scalar path could
+        // not do (enc_qs is already the flat device layout, see enc_qs_flat).
+        cudaMemcpy(d_enc_qs, enc_qs_flat(crs.enc_qs), enc_bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_keys, crs.crs_aes_key.rd_key, 44 * sizeof(uint32_t),
+                   cudaMemcpyHostToDevice);
+        const auto transfer_end = std::chrono::high_resolution_clock::now();
+        const auto compute_srt = std::chrono::high_resolution_clock::now();
+
+        for (int b = 0; b < K; ++b) {
+            launch_accumulate_c_vec_kernel(
+                d_enc_qs, d_pi_all + (std::size_t)live[b] * index,
+                (uint64_t *)d_out_c + (std::size_t)b * total_coeffs_c * 2, index,
+                total_coeffs_c, total_coeffs_c, threads);
+        }
+        cudaCheckError();
+
+        // a_vec. A resident whole A (small keys) needs no fill at all; otherwise
+        // stream A through two chunk buffers, MACing all K traces per chunk.
+        const std::uint64_t a_mask[4] = {mod_mask_lo, mod_mask_hi, 0, 0};
+        void *d_A_res = a_matrix_acquire(
+            reinterpret_cast<const std::uint32_t *>(crs.crs_aes_key.rd_key), a_mask,
+            static_cast<std::size_t>(index), static_cast<std::size_t>(total_coeffs_a),
+            /*big=*/false, /*reserve_bytes=*/enc_bytes, d_keys);
+        const auto a_srt = std::chrono::high_resolution_clock::now();
+        if (d_A_res) {
+            for (int b = 0; b < K; ++b)
+                launch_accumulate_a_vec_kernel(
+                    d_A_res, d_pi_all + (std::size_t)live[b] * index,
+                    (uint64_t *)d_out_a + (std::size_t)b * total_coeffs_a * 2, index,
+                    total_coeffs_a, threads);
+            cudaCheckError();
+            cudaDeviceSynchronize();
+        } else {
+            // Chunk rows so TWO buffers fit what is free after enc_qs/pi/outputs,
+            // capped at 4 GB each (bigger buys nothing -- the fill is already
+            // saturated long before that, and the cap keeps room for the next key).
+            const std::size_t row_bytes = (std::size_t)total_coeffs_a * 16;
+            std::size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            const std::size_t slack = std::size_t(1) << 30;
+            std::size_t per_buf = (free_b > slack) ? (free_b - slack) / 2 : 0;
+            if (per_buf > (std::size_t(4) << 30)) per_buf = std::size_t(4) << 30;
+            int chunk_rows = static_cast<int>(
+                std::max<std::size_t>(1, std::min<std::size_t>(index, per_buf / row_bytes)));
+
+            void *buf[2] = {nullptr, nullptr};
+            const std::size_t buf_bytes = (std::size_t)chunk_rows * row_bytes;
+            const bool two = cudaMalloc(&buf[0], buf_bytes) == cudaSuccess &&
+                             cudaMalloc(&buf[1], buf_bytes) == cudaSuccess;
+            if (!two) {
+                // Could not double-buffer: run the fused per-trace kernel, which
+                // needs no A storage. Correct, just unamortised.
+                cudaGetLastError();
+                if (buf[0]) cudaFree(buf[0]);
+                if (buf[1]) cudaFree(buf[1]);
+                for (int b = 0; b < K; ++b)
+                    launch_generate_a_vec_kernel(
+                        d_pi_all + (std::size_t)live[b] * index,
+                        (uint64_t *)d_out_a + (std::size_t)b * total_coeffs_a * 2,
+                        index, total_coeffs_a, total_coeffs_a, threads, mod_mask_lo,
+                        mod_mask_hi, d_keys);
+                cudaCheckError();
+                cudaDeviceSynchronize();
+            } else {
+                cudaStream_t s_fill, s_mac;
+                cudaStreamCreate(&s_fill);
+                cudaStreamCreate(&s_mac);
+                cudaEvent_t filled[2], maced[2];
+                for (int i = 0; i < 2; ++i) {
+                    cudaEventCreateWithFlags(&filled[i], cudaEventDisableTiming);
+                    cudaEventCreateWithFlags(&maced[i], cudaEventDisableTiming);
+                }
+                int chunk = 0;
+                for (int r0 = 0; r0 < index; r0 += chunk_rows, ++chunk) {
+                    const int rows = std::min(chunk_rows, index - r0);
+                    const int cur = chunk & 1;
+                    // Buffer reuse: this fill must not start until the MACs that
+                    // read buf[cur] two chunks ago have finished.
+                    if (chunk >= 2) cudaStreamWaitEvent(s_fill, maced[cur], 0);
+                    launch_generate_a_matrix(buf[cur], rows, (uint64_t)r0,
+                                             total_coeffs_a, mod_mask_lo, mod_mask_hi,
+                                             d_keys, s_fill);
+                    cudaEventRecord(filled[cur], s_fill);
+                    // ... and the MACs wait for the fill they consume, then every
+                    // trace in the batch reads this chunk before it is overwritten.
+                    cudaStreamWaitEvent(s_mac, filled[cur], 0);
+                    for (int b = 0; b < K; ++b)
+                        launch_accumulate_a_vec_kernel(
+                            buf[cur], d_pi_all + (std::size_t)live[b] * index + r0,
+                            (uint64_t *)d_out_a + (std::size_t)b * total_coeffs_a * 2,
+                            rows, total_coeffs_a, threads, s_mac);
+                    cudaEventRecord(maced[cur], s_mac);
+                }
+                cudaCheckError();
+                cudaStreamSynchronize(s_mac);
+                cudaStreamSynchronize(s_fill);
+                for (int i = 0; i < 2; ++i) {
+                    cudaEventDestroy(filled[i]);
+                    cudaEventDestroy(maced[i]);
+                }
+                cudaStreamDestroy(s_fill);
+                cudaStreamDestroy(s_mac);
+                cudaFree(buf[0]);
+                cudaFree(buf[1]);
+                std::cout << "[PROFILER] a_vec batch: A streamed in " << chunk
+                          << " chunks of " << chunk_rows << " rows, MAC'd by " << K
+                          << " traces per chunk (AES paid once for the batch)\n";
+            }
+        }
+        cudaDeviceSynchronize();
+        const auto a_end = std::chrono::high_resolution_clock::now();
+        std::cout << "[PROFILER] a_vec generation took: "
+                  << std::chrono::duration_cast<std::chrono::microseconds>(a_end - a_srt)
+                             .count() / 1e6
+                  << " seconds (batch of " << K << ")\n";
+
+        // ---- PHASE 3: per trace, assemble + re-randomise.
+        std::vector<uint64_t> host_a((std::size_t)K * total_coeffs_a * 2);
+        std::vector<uint64_t> host_c((std::size_t)K * total_coeffs_c * 2);
+        cudaMemcpy(host_a.data(), d_out_a, host_a.size() * sizeof(uint64_t),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(host_c.data(), d_out_c, host_c.size() * sizeof(uint64_t),
+                   cudaMemcpyDeviceToHost);
+        const auto compute_end = std::chrono::high_resolution_clock::now();
+
+        for (int b = 0; b < K; ++b) {
+            LWE::ciphertext<Rq_T<cpT>, libff::Fr<ppT>, Params> added;
+            const uint64_t *ha = host_a.data() + (std::size_t)b * total_coeffs_a * 2;
+            const uint64_t *hc = host_c.data() + (std::size_t)b * total_coeffs_c * 2;
+            for (int i = 0; i < total_coeffs_a; i++)
+                added.a_vec[i].value = ((unsigned __int128)ha[i * 2 + 1] << 64) |
+                                       (unsigned __int128)ha[i * 2];
+            for (int i = 0; i < total_coeffs_c; i++)
+                added.c_vec[i].value = ((unsigned __int128)hc[i * 2 + 1] << 64) |
+                                       (unsigned __int128)hc[i * 2];
+    #ifndef NOT_PROVABLE_ZK
+            LWE::re_randomize(crs.public_parameter, added);
+    #endif
+            added.rescale();
+            proofs[live[b]] =
+                r1cs_lattice_snark_proof<ppT, cpT, Params>(std::move(added));
+            ok[live[b]] = 1;
+        }
+
+        cudaFree(d_pi_all);
+        cudaFree(d_enc_qs);
+        cudaFree(d_out_a);
+        cudaFree(d_out_c);
+        cudaFree(d_keys);
+        libff::leave_block("Generating response (batch, GPU)");
+        libff::leave_block("Call to r1cs lattice snark prover (batch)");
+
+        using micro_s = std::chrono::microseconds;
+        const double transfer_t =
+            std::chrono::duration_cast<micro_s>(transfer_end - transfer_srt).count();
+        const double compute_t =
+            std::chrono::duration_cast<micro_s>(compute_end - compute_srt).count();
+        if (gpu_time_out) *gpu_time_out = (transfer_t + compute_t) / 1e6;
+        std::cout << "\n  * GPU Data Transfer: " << (transfer_t / 1e6) << "s (one "
+                  << "upload for " << K << " proofs)\n"
+                  << "  * GPU Computation: " << (compute_t / 1e6) << "s\n"
+                  << "  * Linear comb size " << index << " x batch " << K << "\n"
+                  << "  * Batch wall: "
+                  << std::chrono::duration_cast<micro_s>(
+                         std::chrono::high_resolution_clock::now() - t_start)
+                             .count() / 1e6
+                  << "s" << std::endl;
+        return finish();
+        }  // end else (native uint128 ring)
     }
 
     template <typename ppT, typename cpT, class Params>

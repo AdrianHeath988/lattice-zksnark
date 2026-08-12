@@ -100,6 +100,56 @@ namespace LWE {
         static constexpr const uint32_t tau = 5;
         static constexpr const uint64_t p_int = 74ULL * (1ULL << 25) + 1;  // 2483027969, 2adic 26
     };
+    // vFHE: 10th 28-bit prover field (k=81), the 7th Q-chain limb. Extends the
+    // provable chain from 6 to 7 limbs so a depth-5 circuit compiles without
+    // dacapo inserting a bootstrap. Fp_b28_template_pp already carries this prime's
+    // generator/root_of_unity (the k=81 arm), so only the params classes were
+    // missing. 2adic 25 (81 is odd), which still clears the ~2^24 QAP domain the
+    // bit-decomposition gadgets need, and 2^31.34 keeps the chain inside the
+    // 2^30.04..2^31.34 cluster that matches rescaling_factor=30.
+    class B28FpParamsBase10 {
+    public:
+        static constexpr const uint32_t tau = 5;
+        static constexpr const uint64_t p_int = 81ULL * (1ULL << 25) + 1;  // 2717908993, 2adic 25
+    };
+    // 8th Q-chain limb (k=86). Eight limbs is the minimum that lets a depth-5
+    // circuit compile with NO bootstrap: scale management downscales the input to
+    // level 7, then the five mul+rescale pairs walk mod_count 8->4.
+    class B28FpParamsBase11 {
+    public:
+        static constexpr const uint32_t tau = 5;
+        static constexpr const uint64_t p_int = 86ULL * (1ULL << 25) + 1;  // 2885681153, 2adic 26
+    };
+    // 9th..12th Q-chain limbs. Twelve is the HARD ceiling for this field bucket:
+    // Fp_type::s is 25 below, so a chain prime must satisfy p = k*2^25+1, and an
+    // exhaustive scan of that form over [2^30, 2^32) -- the range compatible with
+    // rescaling_factor=30 -- finds exactly 13 primes. One (k=60, 2013265921) is
+    // reserved as the special prime P, leaving these twelve for Q. There is no
+    // 13th 28-bit limb to be had without either dropping the QAP domain below 2^25
+    // or moving to the 60-bit big-int fields.
+    class B28FpParamsBase12 {
+    public:
+        static constexpr const uint32_t tau = 5;
+        static constexpr const uint64_t p_int = 96ULL * (1ULL << 25) + 1;  // 3221225473, 2adic 30
+    };
+    class B28FpParamsBase13 {
+    public:
+        static constexpr const uint32_t tau = 5;
+        static constexpr const uint64_t p_int = 104ULL * (1ULL << 25) + 1; // 3489660929, 2adic 28
+    };
+    class B28FpParamsBase14 {
+    public:
+        static constexpr const uint32_t tau = 5;
+        static constexpr const uint64_t p_int = 116ULL * (1ULL << 25) + 1; // 3892314113, 2adic 27
+    };
+    // The last one in the range: k = 125 = 5^3, so 2adic is exactly 25 -- it clears
+    // the 2^25 QAP domain with nothing to spare. Its generator arm in common.hpp had
+    // to be added (the other three were already there from the L=14 work).
+    class B28FpParamsBase15 {
+    public:
+        static constexpr const uint32_t tau = 5;
+        static constexpr const uint64_t p_int = 125ULL * (1ULL << 25) + 1; // 4194304001, 2adic 25
+    };
 
 
     class B13C10 : public B13Fp2ParamsBase {
@@ -922,6 +972,76 @@ namespace LWE {
         static constexpr const double width = 18.0;
     };
     class B28C15_9 : public B28FpParamsBase9 {
+    public:
+        static constexpr const uint32_t n = 4580;
+        static constexpr const uint64_t q_log = 122;
+        static constexpr const uint128_t q_int = (uint128_t) 1 << q_log;
+        static constexpr const uint128_t rescale_q = q_int;
+        static constexpr const uint32_t query_num = 12;
+        static constexpr const uint128_t b_int = 590679829335140766631067648_U128T;
+        static constexpr const uint32_t pt_dim = query_num * query_size;
+        static constexpr const double width = 18.0;
+    };
+    // 7th Q-chain limb (see B28FpParamsBase10). Same LWE instance parameters as the
+    // other 28-bit chain fields -- only the prime differs.
+    class B28C15_11 : public B28FpParamsBase11 {
+    public:
+        static constexpr const uint32_t n = 4580;
+        static constexpr const uint64_t q_log = 122;
+        static constexpr const uint128_t q_int = (uint128_t) 1 << q_log;
+        static constexpr const uint128_t rescale_q = q_int;
+        static constexpr const uint32_t query_num = 12;
+        static constexpr const uint128_t b_int = 590679829335140766631067648_U128T;
+        static constexpr const uint32_t pt_dim = query_num * query_size;
+        static constexpr const double width = 18.0;
+    };
+    class B28C15_10 : public B28FpParamsBase10 {
+    public:
+        static constexpr const uint32_t n = 4580;
+        static constexpr const uint64_t q_log = 122;
+        static constexpr const uint128_t q_int = (uint128_t) 1 << q_log;
+        static constexpr const uint128_t rescale_q = q_int;
+        static constexpr const uint32_t query_num = 12;
+        static constexpr const uint128_t b_int = 590679829335140766631067648_U128T;
+        static constexpr const uint32_t pt_dim = query_num * query_size;
+        static constexpr const double width = 18.0;
+    };
+    // 9th..12th Q-chain limbs (see B28FpParamsBase12..15). Same LWE instance
+    // parameters as every other 28-bit chain field -- only the prime differs.
+    class B28C15_12 : public B28FpParamsBase12 {
+    public:
+        static constexpr const uint32_t n = 4580;
+        static constexpr const uint64_t q_log = 122;
+        static constexpr const uint128_t q_int = (uint128_t) 1 << q_log;
+        static constexpr const uint128_t rescale_q = q_int;
+        static constexpr const uint32_t query_num = 12;
+        static constexpr const uint128_t b_int = 590679829335140766631067648_U128T;
+        static constexpr const uint32_t pt_dim = query_num * query_size;
+        static constexpr const double width = 18.0;
+    };
+    class B28C15_13 : public B28FpParamsBase13 {
+    public:
+        static constexpr const uint32_t n = 4580;
+        static constexpr const uint64_t q_log = 122;
+        static constexpr const uint128_t q_int = (uint128_t) 1 << q_log;
+        static constexpr const uint128_t rescale_q = q_int;
+        static constexpr const uint32_t query_num = 12;
+        static constexpr const uint128_t b_int = 590679829335140766631067648_U128T;
+        static constexpr const uint32_t pt_dim = query_num * query_size;
+        static constexpr const double width = 18.0;
+    };
+    class B28C15_14 : public B28FpParamsBase14 {
+    public:
+        static constexpr const uint32_t n = 4580;
+        static constexpr const uint64_t q_log = 122;
+        static constexpr const uint128_t q_int = (uint128_t) 1 << q_log;
+        static constexpr const uint128_t rescale_q = q_int;
+        static constexpr const uint32_t query_num = 12;
+        static constexpr const uint128_t b_int = 590679829335140766631067648_U128T;
+        static constexpr const uint32_t pt_dim = query_num * query_size;
+        static constexpr const double width = 18.0;
+    };
+    class B28C15_15 : public B28FpParamsBase15 {
     public:
         static constexpr const uint32_t n = 4580;
         static constexpr const uint64_t q_log = 122;

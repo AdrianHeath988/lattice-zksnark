@@ -254,6 +254,100 @@ __global__ void generate_and_accumulate_a_vec(
     }
 }
 
+// ---------------------------------------------------------------------------
+// SPLIT of generate_and_accumulate_a_vec into (1) an AES-CTR fill that
+// MATERIALISES the a_vec matrix A and (2) a MAC that consumes it.
+//
+// A[i][j] = AES_k(i*elements_per_poly + j) & mask depends only on the CRS AES key
+// and the dimensions -- nothing about the trace. The fused kernel above therefore
+// re-derived all index*n AES blocks for every proof, even when several traces are
+// proved back-to-back against the SAME resident key. Split apart, the host can
+// generate A once, MAC each present trace's pi against it, and free it when the
+// key changes (see a_matrix_cache in r1cs_lattice_snark.hpp).
+//
+// LAYOUT: A is stored TRANSPOSED, [coeff][row], not in the [row][coeff] order the
+// AES counter runs in. The MAC assigns one block per coefficient and strides that
+// block's 256 threads down the rows, so [row][coeff] would make every load stride
+// by n*16 B -- one cache line fetched per 16 B used. Measured at index=16406,
+// n=4580 that cost 0.147 s against 0.006 s for the fused kernel: the "saved" AES
+// was 25x cheaper than the memory traffic it was traded for. Transposed, both the
+// fill's writes and the MAC's reads are contiguous in the row index.
+//
+// A chunk covers rows [row0, row0+rows) and is self-contained: element (i,j) of
+// the chunk lives at j*rows + (i-row0) and still carries the ABSOLUTE counter
+// i*elements_per_poly + j, so a matrix too large to hold whole can be generated
+// and MAC'd a chunk at a time.
+//
+// The grid is 2D -- blockIdx.y is the coefficient, blockIdx.x walks the rows --
+// which keeps the counter arithmetic free of any division.
+__global__ void generate_a_matrix(
+    const uint32_t* __restrict__ global_aes_keys,
+    ulonglong2* __restrict__ out_A,
+    int rows, uint64_t row0, int elements_per_poly,
+    uint64_t mod_mask_lo, uint64_t mod_mask_hi)
+{
+    __shared__ uint8_t s_sbox[256];
+    __shared__ uint32_t s_aes_keys[44];
+    int tid = threadIdx.x;
+    // blockDim.x is fixed at 256 by the launcher, so this covers the whole S-Box.
+    if (tid < 256) s_sbox[tid] = d_sbox[tid];
+    if (tid < 44) s_aes_keys[tid] = global_aes_keys[tid];
+    __syncthreads();
+
+    const uint64_t coeff = blockIdx.y;
+    const uint64_t base = coeff * (uint64_t)rows;
+    const uint64_t stride = (uint64_t)blockDim.x * gridDim.x;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + tid; i < (uint64_t)rows;
+         i += stride) {
+        uint128_cuda v;
+        generate_a_vec_element((row0 + i) * elements_per_poly + coeff, &v,
+                               mod_mask_lo, mod_mask_hi, s_sbox, s_aes_keys);
+        out_A[base + i] = make_ulonglong2(v.lo, v.hi);
+    }
+}
+
+// MAC half of the split: same block-per-coefficient reduction as the fused kernel,
+// reading A from global memory instead of regenerating it. ACCUMULATES into
+// out_a_vec_raw (the host memsets it to 0 once) so a chunked A composes: the sums
+// are mod 2^128 and therefore associative, so any chunking is byte-identical to
+// the single fused launch.
+__global__ void accumulate_a_vec(
+    const ulonglong2* __restrict__ A,
+    const uint64_t* __restrict__ pi,
+    ulonglong2* __restrict__ out_a_vec_raw,
+    int rows)
+{
+    int coeff_idx = blockIdx.x;
+    int tid = threadIdx.x;
+
+    __shared__ uint128_cuda sdata[256];
+    uint128_cuda accum = {0, 0};
+
+    const uint64_t base = (uint64_t)coeff_idx * rows;  // transposed: rows are contiguous
+    for (int i = tid; i < rows; i += blockDim.x) {
+        ulonglong2 val = A[base + i];
+        uint128_cuda a = {val.x, val.y};
+        mac128(&accum, a, pi[i]);
+    }
+
+    sdata[tid] = accum;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && (tid + s) < blockDim.x) {
+            add128(&sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        ulonglong2 cur = out_a_vec_raw[coeff_idx];
+        uint128_cuda acc = {cur.x, cur.y};
+        add128(&acc, sdata[0]);
+        out_a_vec_raw[coeff_idx] = make_ulonglong2(acc.lo, acc.hi);
+    }
+}
+
 // Ensure the C++ wrappers cast the void* to uint64_t*
 // Ensure the C++ wrappers cast the void* to ulonglong2* for vectorized memory!
 void launch_accumulate_c_vec_kernel(
@@ -272,6 +366,35 @@ void launch_generate_a_vec_kernel(
 {
     generate_and_accumulate_a_vec<<<blocks_a, threads_per_block>>>(
         d_aes_round_keys, d_pi, (ulonglong2*)d_out_a_vec, index, total_coeffs_a, mod_mask_lo, mod_mask_hi
+    );
+}
+
+// Split launchers (native uint128 ring). A chunk holds rows [row0, row0+rows) of
+// all total_coeffs_a coefficients, stored transposed as [coeff][row].
+// `stream` lets the batched prover double-buffer: chunk c+1's fill runs on one
+// stream while chunk c's K MACs run on another. 0 is the default stream, which is
+// what every single-proof caller passes.
+void launch_generate_a_matrix(
+    void* d_A, int rows, uint64_t row0, int total_coeffs_a,
+    uint64_t mod_mask_lo, uint64_t mod_mask_hi, const uint32_t* d_aes_round_keys,
+    cudaStream_t stream)
+{
+    const int threads = 256;  // generate_a_matrix's S-Box load assumes exactly 256
+    // Cap the row dimension and let the kernel stride; y is one block per coeff.
+    int bx = (int)((rows + threads - 1) / threads);
+    if (bx > 1024) bx = 1024;
+    if (bx < 1) bx = 1;
+    generate_a_matrix<<<dim3(bx, total_coeffs_a), threads, 0, stream>>>(
+        d_aes_round_keys, (ulonglong2*)d_A, rows, row0, total_coeffs_a,
+        mod_mask_lo, mod_mask_hi);
+}
+
+void launch_accumulate_a_vec_kernel(
+    const void* d_A, const uint64_t* d_pi, void* d_out_a_vec,
+    int rows, int blocks_a, int threads_per_block, cudaStream_t stream)
+{
+    accumulate_a_vec<<<blocks_a, threads_per_block, 0, stream>>>(
+        (const ulonglong2*)d_A, d_pi, (ulonglong2*)d_out_a_vec, rows
     );
 }
 
@@ -384,6 +507,61 @@ __global__ void generate_and_accumulate_a_vec_big(
     }
 }
 
+// Split of generate_and_accumulate_a_vec_big, exactly as for the native ring
+// above, including the transposed [coeff][row] layout. A big element is TWO AES
+// blocks, so its element counter is 2*(i*elements_per_poly + j).
+__global__ void generate_a_matrix_big(
+    const uint32_t* __restrict__ global_aes_keys, uint64_t* __restrict__ out_A,
+    int rows, uint64_t row0, int elements_per_poly,
+    uint64_t m0, uint64_t m1, uint64_t m2, uint64_t m3) {
+    __shared__ uint8_t s_sbox[256];
+    __shared__ uint32_t s_keys[44];
+    int tid = threadIdx.x;
+    if (tid < 256) s_sbox[tid] = d_sbox[tid];
+    if (tid < 44) s_keys[tid] = global_aes_keys[tid];
+    __syncthreads();
+
+    const uint64_t coeff = blockIdx.y;
+    const uint64_t base = coeff * (uint64_t)rows;
+    const uint64_t stride = (uint64_t)blockDim.x * gridDim.x;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + tid; i < (uint64_t)rows;
+         i += stride) {
+        u256p v = gen_a_elem_big(2 * ((row0 + i) * elements_per_poly + coeff),
+                                 s_keys, s_sbox, m0, m1, m2, m3);
+        uint64_t o = (base + i) * 4;
+        out_A[o] = v.w[0]; out_A[o + 1] = v.w[1];
+        out_A[o + 2] = v.w[2]; out_A[o + 3] = v.w[3];
+    }
+}
+
+__global__ void accumulate_a_vec_big(const uint64_t* __restrict__ A,
+                                     const uint64_t* __restrict__ pi,
+                                     uint64_t* __restrict__ out_a_vec, int rows) {
+    int coeff = blockIdx.x, tid = threadIdx.x;
+    __shared__ u256p sdata[256];
+    u256p acc = {0, 0, 0, 0};
+    const uint64_t base = (uint64_t)coeff * rows;  // transposed: rows are contiguous
+    for (int i = tid; i < rows; i += blockDim.x) {
+        uint64_t o = (base + i) * 4;
+        u256p e = {A[o], A[o + 1], A[o + 2], A[o + 3]};
+        mac256p(&acc, &e, pi[i]);
+    }
+    sdata[tid] = acc;
+    __syncthreads();
+    for (unsigned s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && (tid + s) < blockDim.x) add256p(&sdata[tid], &sdata[tid + s]);
+        __syncthreads();
+    }
+    if (tid == 0) {
+        // ACCUMULATE, as accumulate_c_vec_big does, so a chunked A composes.
+        uint64_t o = (uint64_t)coeff * 4;
+        u256p cur = {out_a_vec[o], out_a_vec[o+1], out_a_vec[o+2], out_a_vec[o+3]};
+        add256p(&cur, &sdata[0]);
+        out_a_vec[o] = cur.w[0]; out_a_vec[o+1] = cur.w[1];
+        out_a_vec[o+2] = cur.w[2]; out_a_vec[o+3] = cur.w[3];
+    }
+}
+
 void launch_accumulate_c_vec_big(const uint64_t* d_enc_qs, const uint64_t* d_pi,
                                  uint64_t* d_out_c_vec, int index, int total_coeffs,
                                  int blocks_c, int threads_per_block) {
@@ -396,6 +574,26 @@ void launch_generate_a_vec_big(const uint64_t* d_pi, uint64_t* d_out_a_vec, int 
                                const uint32_t* d_aes_round_keys) {
     generate_and_accumulate_a_vec_big<<<blocks_a, threads_per_block>>>(
         d_aes_round_keys, d_pi, d_out_a_vec, index, total_coeffs_a, m0, m1, m2, m3);
+}
+
+void launch_generate_a_matrix_big(uint64_t* d_A, int rows, uint64_t row0,
+                                  int total_coeffs_a, uint64_t m0, uint64_t m1,
+                                  uint64_t m2, uint64_t m3,
+                                  const uint32_t* d_aes_round_keys,
+                                  cudaStream_t stream) {
+    const int threads = 256;
+    int bx = (int)((rows + threads - 1) / threads);
+    if (bx > 1024) bx = 1024;
+    if (bx < 1) bx = 1;
+    generate_a_matrix_big<<<dim3(bx, total_coeffs_a), threads, 0, stream>>>(
+        d_aes_round_keys, d_A, rows, row0, total_coeffs_a, m0, m1, m2, m3);
+}
+
+void launch_accumulate_a_vec_big(const uint64_t* d_A, const uint64_t* d_pi,
+                                 uint64_t* d_out_a_vec, int rows, int blocks_a,
+                                 int threads_per_block, cudaStream_t stream) {
+    accumulate_a_vec_big<<<blocks_a, threads_per_block, 0, stream>>>(d_A, d_pi,
+                                                                     d_out_a_vec, rows);
 }
 
 // Add this at the bottom of proof.cu

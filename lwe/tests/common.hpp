@@ -202,6 +202,14 @@ public:
             Fp_type::multiplicative_generator = Fp_type(gen);
             Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 116, 3892314113ULL));
         }
+        // The 12th and last Q limb this field bucket can hold: p = k*2^25+1 with
+        // k = 125 = 5^3 is the largest such prime below 2^32, and 2adic is exactly
+        // 25, so it sits right on the Fp_type::s = 25 domain with nothing spare.
+        else if constexpr (ParamsBase::p_int == 4194304001ULL) { // k = 125 = 5^3
+            constexpr uint64_t gen = get_generator(4194304001ULL, 2, 5, 0);
+            Fp_type::multiplicative_generator = Fp_type(gen);
+            Fp_type::root_of_unity = Fp_type(ct_modpow(gen, 125, 4194304001ULL));
+        }
     }
 };
 
