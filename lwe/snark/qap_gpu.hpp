@@ -22,6 +22,7 @@
 // so the caller falls back to the CPU witness map.
 
 #include <cuda_runtime.h>
+#include "vfhe/CudaProfile.h"  // HECATE_CUDA_PROF: time the blocking CUDA calls
 #include <chrono>
 #include <cstdint>
 #include <cstdio>

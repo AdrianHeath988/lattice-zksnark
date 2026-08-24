@@ -55,7 +55,63 @@ namespace libsnark {
     inline bool vfhe_gpu_available() {
         static const bool ok = [] {
             int n = 0;
-            return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
+            const cudaError_t e = cudaGetDeviceCount(&n);
+            const bool good = (e == cudaSuccess && n > 0);
+            // SAY WHY. This one predicate decides between the GPU QAP instance map
+            // and a CPU fallback that materialises the dense A/B/C/H query matrices
+            // in host RAM -- ~560 GB for an 81,920-constraint board, versus ~73 GB
+            // and 100x faster on the GPU path. When it silently returned false the
+            // only symptom was a keygen that ran for half an hour and ate the host,
+            // with the GPU flags all set and looking correct.
+            std::fprintf(stderr,
+                         "[vfhe-gpu] cudaGetDeviceCount -> %s (devices=%d) "
+                         "CUDA_VISIBLE_DEVICES=%s => GPU paths %s\n",
+                         cudaGetErrorString(e), n,
+                         std::getenv("CUDA_VISIBLE_DEVICES")
+                             ? std::getenv("CUDA_VISIBLE_DEVICES")
+                             : "(unset)",
+                         good ? "ENABLED" : "DISABLED (CPU fallback)");
+
+            // HECATE_GPU_STRICT=1 -- REFUSE TO FALL BACK.
+            //
+            // Reaching here with good==false means a GPU path was REQUESTED (every
+            // call site is `vfhe_env_on(FLAG, true) && vfhe_gpu_available()`, and &&
+            // short-circuits, so a deliberate FLAG=0 never gets here) and the device
+            // probe failed. Continuing silently swaps in a CPU path that is ~15x
+            // slower on the prove side and materialises far larger host buffers on
+            // the keygen side -- which for a BENCHMARK quietly corrupts the number
+            // being measured, and is very hard to spot after the fact.
+            //
+            // This is not hypothetical. On 2026-08-20 one of eight GPUs wedged
+            // (RmInitAdapter failed, after a burst of prover SIGFPEs) and the run
+            // kept dispatching to the now-nonexistent index 7. Those jobs silently
+            // took the CPU path: measured 199s -> 3046s of prove time for the SAME
+            // buffer, and they were the jobs reporting verify=FAIL. The run looked
+            // like it was merely slow for hours.
+            //
+            // Opt-in (default off) so a genuinely CPU-only host still works.
+            if (!good && vfhe_env_on("HECATE_GPU_STRICT", false)) {
+                std::fprintf(stderr,
+                    "[vfhe-gpu] CPU FALLBACK DISABLED (HECATE_GPU_STRICT=1).\n"
+                    "  A GPU path was requested but no usable CUDA device was found.\n"
+                    "  cudaGetDeviceCount: %s (devices=%d), CUDA_VISIBLE_DEVICES=%s\n"
+                    "  Refusing to continue on the CPU path: it is ~15x slower and\n"
+                    "  would silently misreport any benchmark taken from this run.\n"
+                    "  Check `nvidia-smi -L` -- the live device COUNT, not a\n"
+                    "  remembered one -- and that CUDA_VISIBLE_DEVICES names an\n"
+                    "  index that still exists. Unset HECATE_GPU_STRICT to allow the\n"
+                    "  CPU path.\n",
+                    cudaGetErrorString(e), n,
+                    std::getenv("CUDA_VISIBLE_DEVICES")
+                        ? std::getenv("CUDA_VISIBLE_DEVICES")
+                        : "(unset)");
+                std::fflush(stderr);
+                // _Exit, not throw: the keygen call site wraps its GPU attempt in a
+                // try/catch that falls back to the CPU generator, so an exception
+                // here would be swallowed and do the very thing this flag forbids.
+                std::_Exit(3);
+            }
+            return good;
         }();
         return ok;
     }

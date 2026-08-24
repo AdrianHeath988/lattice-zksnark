@@ -4,8 +4,12 @@
 #include "r1cs_lattice_snark_common.hpp"
 #include "qap_gpu.hpp"
 #include <cuda_runtime.h>
+#include "vfhe/CudaProfile.h"  // HECATE_CUDA_PROF: time the blocking CUDA calls
 #include <algorithm>
+#include <cstdio>
 #include <functional>
+#include <mutex>
+#include <stdexcept>
 // --- ADD THIS AT THE TOP OF r1cs_lattice_snark.hpp ---
 // Standard C++ declarations that hide the CUDA launch syntax
 void launch_accumulate_c_vec_kernel(
@@ -318,12 +322,44 @@ namespace libsnark {
             std::memset(mask, 0, sizeof(mask));
         }
         void release() {
-            if (d_A) cudaFree(d_A);
+            // SYNCHRONIZE BEFORE FREEING. release() is reachable from CRS eviction,
+            // which is driven by the residency ceiling and is NOT ordered against
+            // the proof that is currently reading A. Freeing under a live kernel
+            // gave an "illegal memory access" at the next cudaCheckError, reported
+            // against whatever proof happened to be running (see the eviction
+            // immediately preceding every observed fault). The sync costs nothing
+            // next to a 9 GB regeneration and makes the free safe from any caller.
+            if (d_A) {
+                cudaDeviceSynchronize();
+                cudaFree(d_A);
+            }
             d_A = nullptr;
             capacity = 0;
             invalidate();
         }
     };
+
+    // Serialises the A-matrix section across threads that share this process's CUDA
+    // context. The cache is ONE ~9 GB device buffer keyed on (keys,mask,rows,coeffs);
+    // giving each worker its own would multiply that by the worker count and
+    // re-create the out-of-memory that killed multi-PROCESS concurrency (measured:
+    // 8 processes already peak at 37.7 of 45 GiB, and 48 processes OOM'd away 19 of
+    // 114 proofs).
+    //
+    // Holding a lock across acquire + the a_vec launch + its sync serialises only the
+    // GPU section. That is deliberate and cheap: the device is ~20% utilised, so the
+    // serialised part is the small part, while the ~80% that is host work (CRS mmap,
+    // witness generation, is_satisfied, artifact write) still overlaps freely across
+    // threads. It also keeps device memory at roughly the single-worker footprint.
+    //
+    // The sync inside the guarded region is REQUIRED, not incidental: the launches are
+    // asynchronous, so releasing the lock before the kernel has consumed d_A would let
+    // the next thread's acquire cudaFree/regenerate the buffer under a live kernel --
+    // exactly the illegal memory access this codebase has hit before.
+    inline std::mutex &a_cache_mutex() {
+        static std::mutex m;
+        return m;
+    }
 
     inline a_matrix_cache &a_cache() {
         // No destructor frees this: a static teardown cudaFree runs after the CUDA
@@ -618,6 +654,7 @@ namespace libsnark {
             // a_vec: single launch over the full index (no enc_qs; d_pi = 256 MB).
             // With a resident A this proof pays only the MAC; a_matrix_acquire
             // returns null when A will not fit and the fused kernel runs instead.
+            std::unique_lock<std::mutex> a_lk(a_cache_mutex());
             void *d_A = a_matrix_acquire(
                 reinterpret_cast<const std::uint32_t *>(crs.crs_aes_key.rd_key), m,
                 static_cast<std::size_t>(index),
@@ -632,6 +669,7 @@ namespace libsnark {
                                         m[0], m[1], m[2], m[3], d_keys);
             cudaCheckError();
             cudaDeviceSynchronize();
+            a_lk.unlock();  // d_A consumed
 
             std::vector<uint64_t> hc(total_coeffs_c * 4), ha(total_coeffs_a * 4);
             cudaMemcpy(hc.data(), d_outc, total_coeffs_c * 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost);
@@ -696,10 +734,60 @@ namespace libsnark {
             d_pi = reinterpret_cast<uint64_t *>(d_pi_qap);
         else
             cudaMalloc(&d_pi, index * sizeof(uint64_t));
-        cudaMalloc(&d_out_a_vec, total_coeffs_a * 2 * sizeof(uint64_t));
-        cudaMalloc(&d_out_c_vec, total_coeffs_c * 2 * sizeof(uint64_t));
-        cudaMalloc(&d_enc_qs, static_cast<std::size_t>(index) * total_coeffs_c * 2 * sizeof(uint64_t));
-        cudaMalloc(&d_aes_round_keys, 44 * sizeof(uint32_t)); 
+        // CHECKED allocations. cudaMalloc leaves the pointer UNTOUCHED on failure,
+        // so an unchecked failure launches the kernel against an uninitialized
+        // pointer -- compute-sanitizer caught exactly that: accumulate_c_vec
+        // reading address 0x6a00, with the nearest real allocation 21.6 GB away.
+        //
+        // It fails because the resident A matrix (a_matrix_cache, ~9 GB) has to
+        // coexist with THIS proof's enc_qs mirror, which for a top-of-chain relin
+        // board is ~21.6 GB on a 46 GB card. A's admission budget is computed from
+        // the proof resident at the time it was taken, so a later, larger board can
+        // still be squeezed out. When that happens, drop A and retry: A is a cache
+        // and is regenerable, the proof is not.
+        auto alloc_or_drop_A = [&](void **p, std::size_t bytes) -> bool {
+            *p = nullptr;
+            if (cudaMalloc(p, bytes) == cudaSuccess) return true;
+            cudaGetLastError();                 // clear the sticky error
+            {   // Visible, because this is the event that decides whether the A
+                // cache can pay at all: if a big board evicts A on every proof,
+                // A is re-materialised each time and the cache is pure overhead.
+                std::size_t fb = 0, tb = 0;
+                cudaMemGetInfo(&fb, &tb);
+                std::fprintf(stderr,
+                             "[a-cache] dropping resident A to fit a %.1f GB "
+                             "allocation (free %.1f / %.1f GB)\n",
+                             bytes / 1e9, fb / 1e9, tb / 1e9);
+            }
+            release_a_matrix_cache();           // give back the ~9 GB and retry once
+            if (cudaMalloc(p, bytes) == cudaSuccess) return true;
+            cudaGetLastError();
+            *p = nullptr;
+            return false;
+        };
+        bool alloc_ok = true;
+        alloc_ok &= alloc_or_drop_A(&d_out_a_vec, total_coeffs_a * 2 * sizeof(uint64_t));
+        alloc_ok &= alloc_or_drop_A(&d_out_c_vec, total_coeffs_c * 2 * sizeof(uint64_t));
+        alloc_ok &= alloc_or_drop_A(&d_enc_qs, static_cast<std::size_t>(index) *
+                                                   total_coeffs_c * 2 * sizeof(uint64_t));
+        alloc_ok &= alloc_or_drop_A(reinterpret_cast<void **>(&d_aes_round_keys),
+                                    44 * sizeof(uint32_t));
+        if (!alloc_ok) {
+            // Out of device memory even without A. Fail loudly here rather than
+            // launching a kernel on a null pointer and reporting an illegal access
+            // against whatever proof happens to be running.
+            std::fprintf(stderr,
+                         "[r1cs_lattice_snark] device allocation failed for a %llu-row "
+                         "x %llu-coeff board (enc_qs %.1f GB); aborting this proof\n",
+                         (unsigned long long)index, (unsigned long long)total_coeffs_c,
+                         (double)index * total_coeffs_c * 2 * sizeof(uint64_t) / 1e9);
+            if (d_out_a_vec) cudaFree(d_out_a_vec);
+            if (d_out_c_vec) cudaFree(d_out_c_vec);
+            if (d_enc_qs) cudaFree(d_enc_qs);
+            if (d_aes_round_keys) cudaFree(d_aes_round_keys);
+            if (!used_gpu_qap && d_pi) cudaFree(d_pi);
+            throw std::runtime_error("r1cs_lattice_snark: device out of memory");
+        }
 
         cudaMemset(d_out_a_vec, 0, total_coeffs_a * 2 * sizeof(uint64_t));
         cudaMemset(d_out_c_vec, 0, total_coeffs_c * 2 * sizeof(uint64_t));
@@ -749,6 +837,7 @@ namespace libsnark {
         // fit, in which case the original fused kernel runs unchanged. It is
         // inside the timed region so the a_vec number below stays honest: the
         // first proof under a key pays the fill, later ones do not.
+        std::unique_lock<std::mutex> a_lk(a_cache_mutex());
         void *d_A = a_matrix_acquire(
             reinterpret_cast<const std::uint32_t *>(crs.crs_aes_key.rd_key), a_mask,
             static_cast<std::size_t>(index), static_cast<std::size_t>(total_coeffs_a),
@@ -769,6 +858,7 @@ namespace libsnark {
 
         cudaEventRecord(stop_a);
         cudaEventSynchronize(stop_a); // Force CPU to wait for GPU
+        a_lk.unlock();  // d_A consumed: release the A section to the next thread
         
         float milliseconds_a = 0;
         cudaEventElapsedTime(&milliseconds_a, start_a, stop_a);
@@ -1043,10 +1133,45 @@ namespace libsnark {
         uint32_t *d_keys = nullptr;
         const std::size_t enc_bytes =
             (std::size_t)index * total_coeffs_c * 2 * sizeof(uint64_t);
-        cudaMalloc(&d_enc_qs, enc_bytes);
-        cudaMalloc(&d_out_a, (std::size_t)K * total_coeffs_a * 2 * sizeof(uint64_t));
-        cudaMalloc(&d_out_c, (std::size_t)K * total_coeffs_c * 2 * sizeof(uint64_t));
-        cudaMalloc(&d_keys, 44 * sizeof(uint32_t));
+        // CHECKED, for the same reason as the single-proof path: an unchecked
+        // failure here leaves the pointer uninitialized and the kernel reads it.
+        // The batch path is MORE exposed, not less -- it holds K witnesses plus a
+        // resident A alongside enc_qs, and A at batch dimensions was measured at
+        // 36.6 GB on a 47.7 GB card. Drop A (regenerable) and retry before failing.
+        auto balloc = [&](void **p, std::size_t bytes) -> bool {
+            *p = nullptr;
+            if (cudaMalloc(p, bytes) == cudaSuccess) return true;
+            cudaGetLastError();
+            {
+                std::size_t fb = 0, tb = 0;
+                cudaMemGetInfo(&fb, &tb);
+                std::fprintf(stderr,
+                             "[a-cache] (batch) dropping resident A to fit a %.1f GB "
+                             "allocation (free %.1f / %.1f GB)\n",
+                             bytes / 1e9, fb / 1e9, tb / 1e9);
+            }
+            release_a_matrix_cache();
+            if (cudaMalloc(p, bytes) == cudaSuccess) return true;
+            cudaGetLastError();
+            *p = nullptr;
+            return false;
+        };
+        bool balloc_ok = true;
+        balloc_ok &= balloc(&d_enc_qs, enc_bytes);
+        balloc_ok &= balloc(&d_out_a, (std::size_t)K * total_coeffs_a * 2 * sizeof(uint64_t));
+        balloc_ok &= balloc(&d_out_c, (std::size_t)K * total_coeffs_c * 2 * sizeof(uint64_t));
+        balloc_ok &= balloc(reinterpret_cast<void **>(&d_keys), 44 * sizeof(uint32_t));
+        if (!balloc_ok) {
+            std::fprintf(stderr,
+                         "[r1cs_lattice_snark] batch device allocation failed "
+                         "(K=%d, enc_qs %.1f GB); aborting this batch\n",
+                         (int)K, (double)enc_bytes / 1e9);
+            if (d_enc_qs) cudaFree(d_enc_qs);
+            if (d_out_a) cudaFree(d_out_a);
+            if (d_out_c) cudaFree(d_out_c);
+            if (d_keys) cudaFree(d_keys);
+            throw std::runtime_error("r1cs_lattice_snark: device out of memory (batch)");
+        }
         cudaMemset(d_out_a, 0, (std::size_t)K * total_coeffs_a * 2 * sizeof(uint64_t));
         cudaMemset(d_out_c, 0, (std::size_t)K * total_coeffs_c * 2 * sizeof(uint64_t));
 
@@ -1070,6 +1195,7 @@ namespace libsnark {
         // a_vec. A resident whole A (small keys) needs no fill at all; otherwise
         // stream A through two chunk buffers, MACing all K traces per chunk.
         const std::uint64_t a_mask[4] = {mod_mask_lo, mod_mask_hi, 0, 0};
+        std::unique_lock<std::mutex> a_res_lk(a_cache_mutex());
         void *d_A_res = a_matrix_acquire(
             reinterpret_cast<const std::uint32_t *>(crs.crs_aes_key.rd_key), a_mask,
             static_cast<std::size_t>(index), static_cast<std::size_t>(total_coeffs_a),
@@ -1161,6 +1287,7 @@ namespace libsnark {
             }
         }
         cudaDeviceSynchronize();
+        a_res_lk.unlock();  // every A consumer (resident or chunked) has synced
         const auto a_end = std::chrono::high_resolution_clock::now();
         std::cout << "[PROFILER] a_vec generation took: "
                   << std::chrono::duration_cast<std::chrono::microseconds>(a_end - a_srt)
@@ -1235,21 +1362,54 @@ namespace libsnark {
         libff::Fr_vector<ppT> Ap(Params::query_num), Bp(Params::query_num),
             Cp(Params::query_num), Hp(Params::query_num);
 
+        // VERIFY IS THE ONE PART OF THIS FILE A CLIENT RUNS, AND IT WAS SERIAL.
+        //
+        // The work is query_num x |statement| x 3 field multiply-accumulates, and
+        // iteration i touches only Ap[i]/Bp[i]/Cp[i] -- distinct elements of vectors
+        // sized query_num, already allocated above. So the outer loop is independent
+        // with no reduction and no shared writes; only `decrypted`, `primary_input`
+        // and the vk prefix rows are read, all const here.
+        //
+        // Measured single-threaded: ~15.2 M statement-elements/s (Atapoor k0=100,
+        // 172.7 M elements in 11.33 s). query_num is 9-11, so this caps at ~10x --
+        // which is the whole gap: it takes the inline verify from 11.33 s to ~1 s,
+        // against the 925 ms Atapoor reports for a circuit 63x smaller.
+        //
+        // Deliberately NOT parallelising over j: that needs a reduction per (i,
+        // matrix), and the outer loop already saturates what query_num offers. And
+        // this is r1cs_lattice_snark_VERIFY -- the prover calls a different function,
+        // so nothing here can move the proving numbers.
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
         for (uint i = 0; i < Params::query_num; i++) {
-            Ap[i] = decrypted[i * LWE::query_size];
-            Bp[i] = decrypted[i * LWE::query_size + 1];
-            Cp[i] = decrypted[i * LWE::query_size + 2];
+            // ACCUMULATE IN LOCALS, store once.
+            //
+            // Not a micro-optimisation -- it is what makes the loop above
+            // parallelisable at all. Ap/Bp/Cp are vectors of only query_num (9-11)
+            // field elements, so Ap[i] and Ap[i+1] sit in the same cache line.
+            // Accumulating directly into them means every one of the millions of +=
+            // in the inner loop is a read-modify-write on a line another thread is
+            // also writing: measured, that took the inline verify from 11.3 s to
+            // 93 s. Bounding the thread pool did not help, because the cost is
+            // coherence traffic, not oversubscription.
+            libff::Fr<ppT> a = decrypted[i * LWE::query_size];
+            libff::Fr<ppT> b = decrypted[i * LWE::query_size + 1];
+            libff::Fr<ppT> c = decrypted[i * LWE::query_size + 2];
             Hp[i] = decrypted[i * LWE::query_size + 3];
 
-            Ap[i] += vk.A_prefix[i][0];
-            Bp[i] += vk.B_prefix[i][0];
-            Cp[i] += vk.C_prefix[i][0];
+            a += vk.A_prefix[i][0];
+            b += vk.B_prefix[i][0];
+            c += vk.C_prefix[i][0];
 
             for (uint64_t j = 0; j < primary_input.size(); j++) {
-                Ap[i] += primary_input[j] * vk.A_prefix[i][j + 1];
-                Bp[i] += primary_input[j] * vk.B_prefix[i][j + 1];
-                Cp[i] += primary_input[j] * vk.C_prefix[i][j + 1];
+                a += primary_input[j] * vk.A_prefix[i][j + 1];
+                b += primary_input[j] * vk.B_prefix[i][j + 1];
+                c += primary_input[j] * vk.C_prefix[i][j + 1];
             }
+            Ap[i] = a;
+            Bp[i] = b;
+            Cp[i] = c;
         }
         libff::leave_block("Decrypting proof");
 
