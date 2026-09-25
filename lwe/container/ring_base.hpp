@@ -143,10 +143,20 @@ namespace libsnark {
         template <uint64_t LENGTH>
         static void discrete_gaussian_sequence(
             std::array<Ring<T, modulus>, LENGTH> &_dest) {
+            discrete_gaussian_sequence(_dest, *prg);
+        }
+
+        // Same sampler, explicit PRG: lets a parallel caller give each thread its
+        // own stream (the global prg's counter is not thread-safe). dg's
+        // probability table is read-only after construction, so it is shared.
+        template <uint64_t LENGTH>
+        static void discrete_gaussian_sequence(
+            std::array<Ring<T, modulus>, LENGTH> &_dest,
+            LWERandomness::PseudoRandomGenerator &prg_) {
             // vFHE fork: 16-byte align so prg_mem_randomize's AES-NI
             // (AES_ecb_encrypt_blks) doesn't segfault on misaligned buffer.
             alignas(16) std::array<uint64_t, LENGTH> rnd_src;
-            prg->prg_mem_randomize(rnd_src);
+            prg_.prg_mem_randomize(rnd_src);
             for (uint64_t i = 0; i < LENGTH; i++) {
                 auto bucket =
                     --dg->probability_interval.lower_bound(rnd_src[i]);

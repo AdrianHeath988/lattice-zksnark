@@ -98,6 +98,11 @@ namespace LWE {
             return *this;
         }
 
+        inline Vector &discrete_gaussian(LWERandomness::PseudoRandomGenerator &prg_) {
+            T::discrete_gaussian_sequence(this->vec, prg_);
+            return *this;
+        }
+
         inline Vector &bounded(const __uint128_t &bound) {
             T::bounded_sequence(bound, this->vec);
             return *this;

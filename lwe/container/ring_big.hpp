@@ -185,8 +185,15 @@ namespace libsnark {
         template <uint64_t LENGTH>
         static void
         discrete_gaussian_sequence(std::array<RingBig, LENGTH> &dest) {
+            discrete_gaussian_sequence(dest, *prg);
+        }
+        // Explicit-PRG variant (per-thread streams); see Ring::discrete_gaussian_sequence.
+        template <uint64_t LENGTH>
+        static void
+        discrete_gaussian_sequence(std::array<RingBig, LENGTH> &dest,
+                                   LWERandomness::PseudoRandomGenerator &prg_) {
             alignas(16) std::array<uint64_t, LENGTH> rnd_src;
-            prg->prg_mem_randomize(rnd_src);
+            prg_.prg_mem_randomize(rnd_src);
             for (uint64_t i = 0; i < LENGTH; i++) {
                 auto bucket = --dg->probability_interval.lower_bound(rnd_src[i]);
                 dest[i] = from_signed(bucket->second);

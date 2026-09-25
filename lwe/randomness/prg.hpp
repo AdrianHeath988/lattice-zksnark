@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <stdexcept>
 #include <iostream>
 #include <map>
 
@@ -32,10 +33,16 @@ namespace LWERandomness {
 
     public:
         PseudoRandomGenerator() : _counter(0), PRG_key{} {
+            // Keep the stream OPEN. This used to close() it after the first
+            // read, so the second default-constructed PRG in a process read
+            // from a closed stream: the read failed silently and the key was
+            // whatever was on the stack. Not thread-safe either; callers that
+            // seed from several threads must serialise construction.
             static std::ifstream urandom("/dev/urandom", std::ios::binary);
             byte buffer[AES_KEY_BYTES];
             urandom.read(reinterpret_cast<char *>(buffer), AES_KEY_BYTES);
-            urandom.close();
+            if (!urandom || urandom.gcount() != AES_KEY_BYTES)
+                throw std::runtime_error("PseudoRandomGenerator: /dev/urandom read failed");
             AES_128_Key_Expansion(buffer, &this->PRG_key);
         }
 

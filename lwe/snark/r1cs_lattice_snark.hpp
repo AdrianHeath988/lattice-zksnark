@@ -103,12 +103,37 @@ namespace libsnark {
             enc_qs;
         LWE::public_parameter<Rq_T<cpT>, Params> public_parameter;
         LWERandomness::AES_KEY crs_aes_key{};
+        // Page-lock registration of enc_qs for the GPU upload (see
+        // enc_qs_host_pin). Declared AFTER enc_qs so it is destroyed first.
+        // mutable: the prover takes the CRS by const& and pins lazily.
+        mutable enc_qs_host_pin host_pin;
 
         r1cs_lattice_snark_crs() = default;
-        r1cs_lattice_snark_crs &
-        operator=(const r1cs_lattice_snark_crs &) = default;
         r1cs_lattice_snark_crs(const r1cs_lattice_snark_crs &) = default;
         r1cs_lattice_snark_crs(r1cs_lattice_snark_crs &&) noexcept = default;
+        // Explicit, not defaulted: the registration must go BEFORE enc_qs's old
+        // buffer is freed, and member-wise assignment would do it after.
+        r1cs_lattice_snark_crs &operator=(const r1cs_lattice_snark_crs &o) {
+            if (this != &o) {
+                host_pin.release();
+                constraint_system = o.constraint_system;
+                enc_qs = o.enc_qs;
+                public_parameter = o.public_parameter;
+                crs_aes_key = o.crs_aes_key;
+            }
+            return *this;
+        }
+        r1cs_lattice_snark_crs &operator=(r1cs_lattice_snark_crs &&o) noexcept {
+            if (this != &o) {
+                host_pin.release();
+                constraint_system = std::move(o.constraint_system);
+                enc_qs = std::move(o.enc_qs);
+                public_parameter = std::move(o.public_parameter);
+                crs_aes_key = o.crs_aes_key;
+                host_pin = std::move(o.host_pin);
+            }
+            return *this;
+        }
 
         explicit r1cs_lattice_snark_crs(
             const r1cs_constraint_system<libff::Fr<ppT>> &cs,
@@ -246,13 +271,17 @@ namespace libsnark {
         genAES_key(&_crs_aes_key);
 
         std::vector<LWE::Vector<Rq_T<cpT>, Params::pt_dim + Params::tau>> dummy;
+        libff::enter_block("CRS/VK objects (constraint-system copy)");
         crs = r1cs_lattice_snark_crs<ppT, cpT, Params>(
             cs, std::move(dummy), std::move(sk_pp.second), _crs_aes_key);
         vk = r1cs_lattice_snark_verification_key<ppT, cpT, Params>(
             std::move(sk_pp.first), std::move(A_prefix), std::move(B_prefix),
             std::move(C_prefix), std::move(Zs));
+        libff::leave_block("CRS/VK objects (constraint-system copy)");
+        libff::enter_block("encrypt_query_matrix");
         encrypt_query_matrix<ppT, cpT, Params>(vk.sk, q_mat, crs.crs_aes_key,
                                                crs.enc_qs);
+        libff::leave_block("encrypt_query_matrix");
 
         libff::leave_block("Generating CRS and VK");
     }
@@ -638,6 +667,7 @@ namespace libsnark {
             // buffer (see enc_qs_flat), so a chunk is a contiguous byte range at
             // r0 * bytes_per_row -- no per-chunk gather, no staging copy.
             const uint64_t *enc_base = enc_qs_flat(crs.enc_qs);
+            enc_qs_pin_host(crs.host_pin, crs.enc_qs);  // once per key; PCIe-rate chunks
             for (int r0 = 0; r0 < index; r0 += chunkRows) {
               const int rows = std::min(chunkRows, index - r0);
               cudaMemcpy(d_enc,
@@ -701,6 +731,9 @@ namespace libsnark {
         // the CPU for every proof -- 6.2 GB / ~7.5 s per proof at index = 7.27M,
         // ~32% of the prover call, all of it redundant across proofs sharing a key.
         const uint64_t* flat_qs_ptr = enc_qs_flat(crs.enc_qs);
+        // Page-lock the buffer once per key (no-op on every later proof) so the
+        // 6.2 GB upload below runs at PCIe rate: 2.2 s -> ~0.25 s at index 7.27M.
+        enc_qs_pin_host(crs.host_pin, crs.enc_qs);
 
         std::vector<uint64_t> flat_pi;
         if (!used_gpu_qap) {
@@ -1175,6 +1208,7 @@ namespace libsnark {
         cudaMemset(d_out_a, 0, (std::size_t)K * total_coeffs_a * 2 * sizeof(uint64_t));
         cudaMemset(d_out_c, 0, (std::size_t)K * total_coeffs_c * 2 * sizeof(uint64_t));
 
+        enc_qs_pin_host(crs.host_pin, crs.enc_qs);  // once per key; PCIe-rate upload
         const auto transfer_srt = std::chrono::high_resolution_clock::now();
         // ONE upload for the whole batch -- the amortisation the scalar path could
         // not do (enc_qs is already the flat device layout, see enc_qs_flat).

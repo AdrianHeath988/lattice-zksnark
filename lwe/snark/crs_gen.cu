@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cuda_runtime.h>
+#include <chrono>
 
 namespace {
 
@@ -336,14 +337,21 @@ extern "C" int launch_crs_encrypt(const uint64_t *h_S_T, const uint64_t *h_uv,
     const size_t shmem = (size_t)n * sizeof(u128);
     CK(cudaFuncSetAttribute(crs_encrypt_kernel,
                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem));
+    // Per-phase wall clock, so a keygen log says where a 2^14 key's minutes go
+    // (H2D of uv, kernel, D2H into enc_qs) instead of one opaque block time.
+    double t_h2d = 0, t_kern = 0, t_d2h = 0;
+    auto now = [] { return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count(); };
     // One row-chunk at a time; uv/enc are indexed chunk-locally, row_offset makes
     // the AES stream absolute so the output matches an unchunked run bit-for-bit.
     for (uint64_t off = 0; off < rows; off += chunk_rows) {
       const uint64_t this_rows =
           (rows - off < (uint64_t)chunk_rows) ? (rows - off) : (uint64_t)chunk_rows;
+      double t0 = now();
       CK(cudaMemcpy(d_uv, h_uv + off * cdim,
                     (size_t)this_rows * cdim * sizeof(uint64_t),
                     cudaMemcpyHostToDevice));
+      double t1 = now(); t_h2d += t1 - t0;
       // Cap grid; the kernel grid-strides over rows.
       const int blocks = (int)((this_rows < 65535) ? this_rows : 65535);
       crs_encrypt_kernel<<<blocks, threads, shmem>>>(d_S_T, d_uv, d_keys, d_enc,
@@ -351,10 +359,17 @@ extern "C" int launch_crs_encrypt(const uint64_t *h_S_T, const uint64_t *h_uv,
                                                      mask_lo, mask_hi);
       CK(cudaGetLastError());
       CK(cudaDeviceSynchronize());
+      double t2 = now(); t_kern += t2 - t1;
       CK(cudaMemcpy(h_enc + off * cdim * 2, d_enc,
                     (size_t)this_rows * cdim * sizeof(u128),
                     cudaMemcpyDeviceToHost));
+      t_d2h += now() - t2;
     }
+    fprintf(stderr,
+            "[crs_gen] encrypt rows=%llu n=%u cdim=%u chunks=%llu: H2D %.1fs, kernel %.1fs, D2H %.1fs (%.1f GB out)\n",
+            (unsigned long long)rows, n, cdim,
+            (unsigned long long)((rows + chunk_rows - 1) / chunk_rows), t_h2d, t_kern, t_d2h,
+            (double)rows * cdim * sizeof(u128) / 1e9);
   }
   e = cudaSuccess;
 fail:

@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
@@ -166,6 +167,109 @@ namespace libsnark {
                               : reinterpret_cast<uint64_t *>(enc_qs.data());
     }
 
+    // Page-locks the enc_qs host buffer so the per-proof host->device upload runs
+    // at PCIe rate instead of through the driver's pageable staging path. Measured
+    // on an L40S (PCIe 4 x16) with a 6 GB std::vector buffer: 5.5 GB/s pageable
+    // vs 26.9 GB/s registered, and cudaHostRegister itself costs 0.19 s ONCE.
+    // The upload was 2.2 s per proof at index 7.27M (the single largest GPU-side
+    // cost in the prover), so this is ~2 s per proof for a one-off 0.2 s.
+    //
+    // No copy site changes: cudaMemcpy detects a registered range on its own.
+    //
+    // OWNED BY THE CRS, not a side table keyed on the pointer. A buffer that is
+    // freed while still registered is not merely a leak: the driver keeps the old
+    // physical pages pinned under that virtual range, and if a later allocation
+    // lands on the same addresses a cudaMemcpy from it DMAs the OLD pages -- a
+    // silently wrong proof, not a fault. Tying the registration to the vector's
+    // owner (declared after enc_qs, so destroyed before it) closes that.
+    // The CRS's assignment operators release() before the vector is replaced for
+    // the same reason. Copies start unregistered (they own a different buffer);
+    // moves carry the registration, since a moved vector keeps its buffer.
+    //
+    // HECATE_CRS_PIN=0 disables. Registration failure is non-fatal: the copy
+    // simply stays pageable, exactly as before.
+    class enc_qs_host_pin {
+    public:
+        enc_qs_host_pin() = default;
+        enc_qs_host_pin(const enc_qs_host_pin &) noexcept {}
+        enc_qs_host_pin(enc_qs_host_pin &&o) noexcept
+            : ptr_(o.ptr_), bytes_(o.bytes_) {
+            o.ptr_ = nullptr;
+            o.bytes_ = 0;
+        }
+        enc_qs_host_pin &operator=(const enc_qs_host_pin &) noexcept {
+            release();
+            return *this;
+        }
+        enc_qs_host_pin &operator=(enc_qs_host_pin &&o) noexcept {
+            if (this != &o) {
+                release();
+                ptr_ = o.ptr_;
+                bytes_ = o.bytes_;
+                o.ptr_ = nullptr;
+                o.bytes_ = 0;
+            }
+            return *this;
+        }
+        ~enc_qs_host_pin() { release(); }
+
+        // Register [p, p+bytes). Idempotent for the same range; re-registers if
+        // the buffer moved (a reload into the same CRS object).
+        void ensure(const void *p, std::size_t bytes) {
+            if (!p || !bytes) return;
+            // The CRS is shared by every prover thread on a shape; serialise so
+            // the first proofs under a key do not race to register the same range.
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (ptr_ == p && bytes_ == bytes) return;
+            release_locked();
+            if (!vfhe_env_on("HECATE_CRS_PIN", true)) return;
+            const auto t0 = std::chrono::steady_clock::now();
+            const cudaError_t e = cudaHostRegister(
+                const_cast<void *>(p), bytes, cudaHostRegisterPortable);
+            if (e != cudaSuccess) {
+                cudaGetLastError();  // clear the sticky error; stay pageable
+                std::fprintf(stderr,
+                             "[crs-pin] cudaHostRegister(%.1f GB) failed: %s "
+                             "-- enc_qs uploads stay pageable\n",
+                             bytes / 1e9, cudaGetErrorString(e));
+                return;
+            }
+            ptr_ = p;
+            bytes_ = bytes;
+            std::fprintf(stderr, "[crs-pin] pinned enc_qs %.1f GB in %.2f s\n",
+                         bytes / 1e9,
+                         std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count());
+        }
+        void release() noexcept {
+            std::lock_guard<std::mutex> lk(mtx_);
+            release_locked();
+        }
+        bool pinned() const { return ptr_ != nullptr; }
+
+    private:
+        void release_locked() noexcept {
+            if (!ptr_) return;
+            // At process exit the runtime may already be torn down; the error is
+            // harmless and there is nothing to do about it.
+            cudaHostUnregister(const_cast<void *>(ptr_));
+            cudaGetLastError();
+            ptr_ = nullptr;
+            bytes_ = 0;
+        }
+        std::mutex mtx_;  // not moved: each object guards its own registration
+        const void *ptr_ = nullptr;
+        std::size_t bytes_ = 0;
+    };
+
+    template <typename T, uint64_t LEN>
+    inline void
+    enc_qs_pin_host(enc_qs_host_pin &pin,
+                    const std::vector<LWE::Vector<T, LEN>> &enc_qs) {
+        pin.ensure(enc_qs_flat(enc_qs), enc_qs.size() * sizeof(LWE::Vector<T, LEN>));
+    }
+
     template <typename ppT, uint32_t pt_dim>
     using r1cs_lattice_snark_query_matrix =
         std::vector<LWE::Vector<libff::Fr<ppT>, pt_dim>>;
@@ -205,12 +309,22 @@ namespace libsnark {
             public_params_init<RT...>(prg, dg);
     }
 
+    // Fresh AES key from /dev/urandom. The stream stays OPEN: it used to be
+    // close()d after the first read, so every later call in the process (the
+    // prover's per-proof masking key; the 2nd..nth key of a multi-key genonly
+    // pass) read from a closed stream, failed silently, and expanded whatever
+    // bytes were on the stack. Serialised so parallel callers stay safe.
     inline void genAES_key(LWERandomness::AES_KEY *_key) {
         static std::ifstream urandom("/dev/urandom", std::ios::binary);
+        static std::mutex mtx;
         LWERandomness::byte buffer[LWERandomness::AES_KEY_BYTES];
-        urandom.read(reinterpret_cast<char *>(buffer),
-                     LWERandomness::AES_KEY_BYTES);
-        urandom.close();
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            urandom.read(reinterpret_cast<char *>(buffer),
+                         LWERandomness::AES_KEY_BYTES);
+            if (!urandom || urandom.gcount() != LWERandomness::AES_KEY_BYTES)
+                throw std::runtime_error("genAES_key: /dev/urandom read failed");
+        }
         LWERandomness::AES_128_Key_Expansion(buffer, _key);
     }
 
@@ -268,8 +382,10 @@ namespace libsnark {
         const uint32_t n = Params::n;
         const uint32_t cdim = Params::pt_dim + Params::tau;
         const uint64_t rows = q_mat.size();
+        libff::enter_block("CRS encrypt host prep (resize + S_T + uv)");
         enc_qs.resize(rows);
 
+        {  // hS/hUV scope: their teardown is timed as its own block below
         std::vector<uint64_t> hS((size_t)2 * cdim * n);
         for (uint32_t out = 0; out < cdim; out++)
             for (uint32_t k = 0; k < n; k++) {
@@ -280,6 +396,12 @@ namespace libsnark {
             }
 
         std::vector<uint64_t> hUV((size_t)rows * cdim);
+        // Rows are independent (Tv is per-row, hUV writes are disjoint) and this
+        // was the serial CPU phase between the GPU QAP map and the GPU encrypt:
+        // ~35M rows x tau*pt_dim field mults for a 2^14 relin key, on ONE core
+        // while the GPU sat idle. Plan-gen already exports OMP_NUM_THREADS per
+        // child (cores/gpus); nothing here used it before.
+        #pragma omp parallel for schedule(static)
         for (uint64_t i = 0; i < rows; i++) {
             auto Tv = sk.T_mat * q_mat[i];  // Vector<Fr, tau>
             for (uint32_t out = 0; out < Params::pt_dim; out++)
@@ -294,14 +416,20 @@ namespace libsnark {
         const uint64_t mask_lo = (q_log >= 64) ? ~0ull : ((1ull << q_log) - 1);
         const uint64_t mask_hi =
             (q_log > 64) ? ((1ull << (q_log - 64)) - 1) : 0ull;
+        libff::leave_block("CRS encrypt host prep (resize + S_T + uv)");
 
         // The kernel's h_enc layout ([row*cdim + out] -> (lo,hi)) is exactly
         // enc_qs's own memory, so it D2H's straight into the CRS -- no staging
         // buffer, no unflatten pass. enc_qs is flat from the moment it is written.
+        libff::enter_block("CRS encrypt (GPU launch)");
         int rc = launch_crs_encrypt(hS.data(), hUV.data(), keys, rows, n, cdim,
                                     mask_lo, mask_hi, enc_qs_flat(enc_qs));
+        libff::leave_block("CRS encrypt (GPU launch)");
         if (rc != 0)
             throw std::runtime_error("launch_crs_encrypt failed");
+        libff::enter_block("CRS encrypt host teardown (free uv/S_T)");
+        }
+        libff::leave_block("CRS encrypt host teardown (free uv/S_T)");
     }
 
     // Big-int (256-bit RingBig) GPU encrypt loop (NOISELESS). Mirrors
@@ -329,6 +457,12 @@ namespace libsnark {
             }
 
         std::vector<uint64_t> hUV((size_t)rows * cdim);
+        // Rows are independent (Tv is per-row, hUV writes are disjoint) and this
+        // was the serial CPU phase between the GPU QAP map and the GPU encrypt:
+        // ~35M rows x tau*pt_dim field mults for a 2^14 relin key, on ONE core
+        // while the GPU sat idle. Plan-gen already exports OMP_NUM_THREADS per
+        // child (cores/gpus); nothing here used it before.
+        #pragma omp parallel for schedule(static)
         for (uint64_t i = 0; i < rows; i++) {
             auto Tv = sk.T_mat * q_mat[i];
             for (uint32_t out = 0; out < Params::pt_dim; out++)
@@ -442,12 +576,37 @@ namespace libsnark {
             }
         }
 
-        // Gaussian noise pass (kept on host; uses the restored ppT::dg).
-        for (auto &row : enc_qs) {
-            LWE::Vector<Rq_T<cpT>, Params::pt_dim + Params::tau> ev;
-            ev.discrete_gaussian();
-            row += ev * Params::p_int;
+        // Gaussian noise pass (kept on host). Measured at N=2^14 (35M rows x 53):
+        // 62 s of the 227 s "Generating CRS and VK" block when run serially off
+        // the one global PRG -- more than the GPU kernel's host-visible overhead
+        // and second only to the kernel itself. The noise is fresh randomness
+        // that nothing regenerates (unlike a_vec), so each thread may draw from
+        // its own /dev/urandom-seeded PRG; the Gaussian table it indexes is
+        // shared read-only. Row updates are disjoint.
+        libff::enter_block("CRS Gaussian noise pass");
+        if (vfhe_env_on("HECATE_CRS_NOISE_SERIAL", false)) {
+            // Diagnostic: the original serial loop off the global prg/dg.
+            for (auto &row : enc_qs) {
+                LWE::Vector<Rq_T<cpT>, Params::pt_dim + Params::tau> ev;
+                ev.discrete_gaussian();
+                row += ev * Params::p_int;
+            }
+        } else {
+            const int64_t nrows = static_cast<int64_t>(enc_qs.size());
+            #pragma omp parallel
+            {
+                LWERandomness::AES_KEY tkey;
+                genAES_key(&tkey);  // serialised inside; fresh key per thread
+                LWERandomness::PseudoRandomGenerator tprg(tkey);
+                #pragma omp for schedule(static)
+                for (int64_t i = 0; i < nrows; i++) {
+                    LWE::Vector<Rq_T<cpT>, Params::pt_dim + Params::tau> ev;
+                    ev.discrete_gaussian(tprg);
+                    enc_qs[i] += ev * Params::p_int;
+                }
+            }
         }
+        libff::leave_block("CRS Gaussian noise pass");
     }
 
     template <typename pdpT, typename ppT, uint32_t pt_dim>
